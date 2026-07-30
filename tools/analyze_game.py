@@ -57,10 +57,15 @@ def fetch(share_code: str) -> dict:
 
 
 def parse_token(tok: str) -> tuple[str, int, int]:
-    """``('pawn'|'h'|'v', file_index, rank)``."""
+    """``('pawn'|'h'|'v', file_index, rank)``.
+
+    Walls are exactly three characters (``h``/``v`` + file + rank); pawn moves
+    are two (file + rank). Length disambiguates moves like ``h6``, which is a
+    pawn stepping to file h, not a malformed wall.
+    """
     tok = tok.strip()
-    if tok and tok[0] in "hv":
-        return tok[0], FILES.index(tok[1]), int(tok[2:])
+    if len(tok) == 3 and tok[0] in "hv":
+        return tok[0], FILES.index(tok[1]), int(tok[2])
     return "pawn", FILES.index(tok[0]), int(tok[1:])
 
 
@@ -115,7 +120,9 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("game", help="share code, e.g. b8ewfg")
     ap.add_argument("--checkpoint", default="checkpoints/best.pt")
-    ap.add_argument("--sims", type=int, default=1200)
+    ap.add_argument("--sims", type=int, default=8192)
+    ap.add_argument("--leaf", type=int, default=32,
+                    help="leaves per network call (1 = exact sequential search)")
     ap.add_argument("--blunder", type=float, default=0.35,
                     help="eval drop that counts as a mistake")
     args = ap.parse_args()
@@ -138,8 +145,10 @@ def main() -> None:
     torch.backends.cudnn.benchmark = True
     fr.warmup()
     net, meta = load_checkpoint(args.checkpoint, device)
-    ev = NetEvaluator(net, device=device, graph_batches=(1,))
-    mcts = BatchedMCTS(ev, n_games=1, max_nodes=args.sims + 128)
+    shapes = (1,) if args.leaf <= 1 else (1, args.leaf)
+    ev = NetEvaluator(net, device=device, graph_batches=shapes)
+    mcts = BatchedMCTS(ev, n_games=1, max_nodes=args.sims + 128,
+                       leaf_batch=args.leaf)
     print(f"engine: {meta.get('checkpoint', args.checkpoint)} "
           f"(gen {meta.get('iteration', '?')}) at {args.sims} sims/move")
 
