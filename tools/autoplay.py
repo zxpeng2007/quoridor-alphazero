@@ -102,28 +102,23 @@ BOARD_JS = r"""() => {
                 vrow: Math.round((r.y + r.height / 2 - oy - cell / 2) / pitch)});
   });
 
-  // A placed wall is opaque and coloured. The hover ghost is translucent grey
-  // (gray-300 at low alpha), so it must be rejected on BOTH counts -- checking
-  // only `opacity: 0` lets a partially faded ghost through and invents a wall.
-  const isWallPaint = (ks) => {
-    if (ks.opacity !== '' && parseFloat(ks.opacity) < 0.9) return false;
-    const m = ks.backgroundColor.match(/rgba?\(([^)]+)\)/);
-    if (!m) return false;
-    const p = m[1].split(',').map(s => parseFloat(s));
-    const [r, g, b] = p;
-    const alpha = p.length > 3 ? p[3] : 1;
-    if (alpha < 0.9) return false;                       // translucent => ghost
-    const spread = Math.max(r, g, b) - Math.min(r, g, b);
-    if (spread < 20) return false;                       // grey => ghost
-    return true;
-  };
+  // Distinguishing a placed wall from the hover preview cannot be done by
+  // colour: live games paint walls grey (#cccccc), the same family as the
+  // gray-300 preview, and the analysis view paints them red/blue. The reliable
+  // difference is structural -- the preview is defined by `group-hover:`
+  // classes, a real wall is not.
   const walls = [];
   document.querySelectorAll('[data-testid^="slot-"]').forEach(el => {
-    const kid = el.firstElementChild;
-    if (!kid) return;
-    const ks = getComputedStyle(kid);
-    if (!isWallPaint(ks)) return;
-    walls.push({tid: el.dataset.testid, bg: ks.backgroundColor});
+    for (const kid of el.querySelectorAll('div')) {
+      const cls = (kid.className || '').toString();
+      if (cls.includes('group-hover')) continue;          // hover preview
+      const ks = getComputedStyle(kid);
+      if (ks.backgroundColor === 'rgba(0, 0, 0, 0)' &&
+          ks.backgroundImage === 'none') continue;
+      if (parseFloat(ks.opacity) < 0.9) continue;
+      walls.push({tid: el.dataset.testid, bg: ks.backgroundColor});
+      break;
+    }
   });
 
   // The site rings every legal pawn destination while it is your move, and
@@ -150,6 +145,19 @@ BOARD_JS = r"""() => {
           gameOver: /won by|you won|you lost|has resigned|rematch|play again/i
                       .test(text),
           text: text.slice(0, 300)};
+}"""
+
+TRAY_JS = r"""() => {
+  // The two draggable barricade pieces; the wide one places horizontal walls.
+  const out = [];
+  document.querySelectorAll('[role="button"]').forEach(el => {
+    if (getComputedStyle(el).cursor !== 'grab') return;
+    const r = el.getBoundingClientRect();
+    if (r.width < 8 || r.height < 8) return;
+    out.push({horizontal: r.width > r.height,
+              cx: r.x + r.width / 2, cy: r.y + r.height / 2});
+  });
+  return out;
 }"""
 
 CLOCKS_JS = r"""() => {
@@ -311,23 +319,45 @@ class Bridge:
         self.page.mouse.click(x, y)
 
     def play_wall(self, action: int, flipped: bool) -> bool:
+        """Place a wall by dragging the matching tray piece onto the slot.
+
+        Clicking a slot does NOT work: a bare click always commits the tray's
+        currently selected orientation, which is vertical, so clicking a
+        horizontal slot silently places a vertical wall at the same coordinates
+        (verified against the live site). Selecting the tray piece first does
+        not change that. Only the drag carries the orientation.
+        """
         orient, slot = divmod(action, fr.NUM_WALL_SLOTS)
         wr, wc = divmod(slot, 8)
         if flipped:
             wr = 7 - wr
-        tid = f"slot-{'horizontal' if orient == 0 else 'vertical'}-{wr}-{wc}"
+        want_horizontal = orient == 0
+        tid = f"slot-{'horizontal' if want_horizontal else 'vertical'}-{wr}-{wc}"
+
         el = self.page.locator(f'[data-testid="{tid}"]')
         if not el.count():
             return False
         box = el.first.bounding_box()
         if not box:
             return False
-        cx, cy = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
-        # Hovering reveals the ghost wall; a plain click commits it in the
-        # current build. Fall back to a short press-drag for drag-only builds.
-        self.page.mouse.move(cx, cy)
-        self.page.wait_for_timeout(120)
-        self.page.mouse.click(cx, cy)
+
+        tray = [t for t in self.page.evaluate(TRAY_JS)
+                if t["horizontal"] == want_horizontal]
+        if not tray:
+            print("  !! could not find the barricade tray piece to drag")
+            return False
+        src = tray[0]
+        tx, ty = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+
+        # dnd-kit ignores a teleporting cursor; it needs real intermediate moves.
+        self.page.mouse.move(src["cx"], src["cy"])
+        self.page.mouse.down()
+        for i in range(1, 21):
+            self.page.mouse.move(src["cx"] + (tx - src["cx"]) * i / 20,
+                                 src["cy"] + (ty - src["cy"]) * i / 20)
+            self.page.wait_for_timeout(20)
+        self.page.wait_for_timeout(250)
+        self.page.mouse.up()
         return True
 
 

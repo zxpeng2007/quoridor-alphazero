@@ -65,26 +65,22 @@ BOARD_JS = r"""() => {
                 vrow: Math.round((r.y + r.height / 2 - oy - cell / 2) / pitch)});
   });
 
-  // A placed wall is opaque and coloured; the hover ghost is translucent grey.
-  // Slots with no child at all are ones a crossing wall has made unavailable.
-  const isWallPaint = (ks) => {
-    if (ks.opacity !== '' && parseFloat(ks.opacity) < 0.9) return false;
-    const m = ks.backgroundColor.match(/rgba?\(([^)]+)\)/);
-    if (!m) return false;
-    const p = m[1].split(',').map(s => parseFloat(s));
-    const [r, g, b] = p;
-    const alpha = p.length > 3 ? p[3] : 1;
-    if (alpha < 0.9) return false;
-    if (Math.max(r, g, b) - Math.min(r, g, b) < 20) return false;
-    return true;
-  };
+  // Must stay identical to autoplay.py. Colour cannot separate a placed wall
+  // from the hover preview -- live games paint walls grey (#cccccc), the same
+  // family as the gray-300 preview. The structural difference is reliable: the
+  // preview is defined by `group-hover:` classes, a real wall is not.
   const walls = [];
   document.querySelectorAll('[data-testid^="slot-"]').forEach(el => {
-    const kid = el.firstElementChild;
-    if (!kid) return;
-    const ks = getComputedStyle(kid);
-    if (!isWallPaint(ks)) return;
-    walls.push({tid: el.dataset.testid, bg: ks.backgroundColor});
+    for (const kid of el.querySelectorAll('div')) {
+      const cls = (kid.className || '').toString();
+      if (cls.includes('group-hover')) continue;
+      const ks = getComputedStyle(kid);
+      if (ks.backgroundColor === 'rgba(0, 0, 0, 0)' &&
+          ks.backgroundImage === 'none') continue;
+      if (parseFloat(ks.opacity) < 0.9) continue;
+      walls.push({tid: el.dataset.testid, bg: ks.backgroundColor});
+      break;
+    }
   });
 
   const text = document.body.innerText;
