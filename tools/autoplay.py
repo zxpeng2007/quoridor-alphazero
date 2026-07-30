@@ -140,8 +140,22 @@ BOARD_JS = r"""() => {
   }
 
   const text = document.body.innerText;
-  const bars = (text.match(/Barricades:\s*(\d+)\s*\/\s*10/g) || [])
-    .map(s => +s.match(/(\d+)/)[1]);
+  // Each player's remaining barricades, taken from its own panel. The panel
+  // carries a colour swatch (bg-red-500 / bg-blue-500) matching that player's
+  // pawn, which identifies the owner outright. Ownership cannot be read from
+  // the walls themselves -- live games paint every wall the same grey.
+  const bars = [];
+  document.querySelectorAll('div').forEach(el => {
+    const m = (el.textContent || '').trim()
+      .match(/^Barricades:\s*(\d+)\s*\/\s*10$/);
+    if (!m) return;
+    const swatch = el.querySelector('span[class*="bg-"]');
+    const scls = swatch ? (swatch.className || '').toString() : '';
+    const colour = scls.includes('bg-red') ? 'red'
+                 : scls.includes('bg-blue') ? 'blue' : null;
+    bars.push({n: +m[1], colour, y: el.getBoundingClientRect().y});
+  });
+  bars.sort((a, b) => a.y - b.y);
   return {geo: {bx: bb.x, by: bb.y, pitch, cell, gap, ox, oy},
           flipped, pawns, walls, highlights, barricades: bars,
           youArePlayer: (text.match(/You are Player (\d)/) || [])[1] || null,
@@ -283,20 +297,28 @@ class Bridge:
         st[fr.IDX_P0] = by_colour["red"]
         st[fr.IDX_P1] = by_colour["blue"]
 
-        bars = dom.get("barricades") or []
-        walls_expected = -1
-        if len(bars) == 2:
-            # Order on the page is not guaranteed; only the total is a checksum.
-            walls_expected = 20 - (bars[0] + bars[1])
-            placed_p0 = sum(1 for w in dom["walls"] if "178" in w["bg"])
-            placed_p1 = len(dom["walls"]) - placed_p0
-            st[fr.IDX_WL0] = max(0, 10 - placed_p0)
-            st[fr.IDX_WL1] = max(0, 10 - placed_p1)
-
         you = dom.get("youArePlayer")
         us = 0 if you == "1" else 1 if you == "2" else None
         if us is None:
             return None, "could not determine which seat we are playing"
+
+        bars = dom.get("barricades") or []
+        walls_expected = -1
+        if len(bars) == 2:
+            walls_expected = 20 - (bars[0]["n"] + bars[1]["n"])
+            by_col = {b["colour"]: b["n"] for b in bars if b["colour"]}
+            if {"red", "blue"} <= set(by_col):
+                # Same convention as the pawns: red is the first seat.
+                st[fr.IDX_WL0] = by_col["red"]
+                st[fr.IDX_WL1] = by_col["blue"]
+            else:
+                # Fallback: panels run opponent-above-us, since the board
+                # always orients the local player at the bottom.
+                st[fr.IDX_WL0 if us == 0 else fr.IDX_WL1] = bars[1]["n"]
+                st[fr.IDX_WL0 if us == 1 else fr.IDX_WL1] = bars[0]["n"]
+        else:
+            return None, (f"expected two barricade counters, found {len(bars)} "
+                          "-- cannot tell how many walls remain")
 
         highlights: dict[int, tuple[float, float]] = {}
         for h in dom.get("highlights") or []:
@@ -482,9 +504,25 @@ def play_one_move(bridge: Bridge, engine: Engine, args) -> str:
     if read.game_over:
         return "game-over"
     if read.walls_expected >= 0 and read.walls_seen != read.walls_expected:
-        print(f"  !! wall cross-check failed: {read.walls_seen} walls in the DOM, "
-              f"barricade counters imply {read.walls_expected}")
-        return "inconsistent"
+        # A wall placed moments ago may still be fading in (the slot child
+        # carries a 150ms transition), so the DOM can legitimately lag the
+        # counters for an instant. Re-read a few times; only a persistent
+        # disagreement means we have actually misread the board.
+        settled = None
+        for _ in range(5):
+            bridge.page.wait_for_timeout(300)
+            dom_retry = bridge.snapshot()
+            cand, _ = bridge.decode(dom_retry) if dom_retry else (None, "")
+            if cand is not None and cand.walls_seen == cand.walls_expected:
+                settled = cand
+                break
+        if settled is None:
+            print(f"  !! wall cross-check failed: {read.walls_seen} walls in the "
+                  f"DOM, barricade counters imply {read.walls_expected}")
+            return "inconsistent"
+        read = settled
+        if read.game_over:
+            return "game-over"
 
     # A dry run exists to validate the *reader*, so it reports the position
     # unconditionally rather than waiting for our turn -- otherwise a turn
