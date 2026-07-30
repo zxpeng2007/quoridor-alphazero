@@ -39,19 +39,26 @@ from quoridor.mcts import BatchedMCTS
 # Engine strength presets. Temperature > 0 samples from the visit distribution,
 # which both weakens and varies play -- right for practice opponents.
 LEVELS: dict[str, dict[str, float]] = {
-    "beginner": {"sims": 24, "temperature": 1.0},
-    "easy": {"sims": 96, "temperature": 0.6},
-    "medium": {"sims": 320, "temperature": 0.0},
-    "hard": {"sims": 800, "temperature": 0.0},
-    "max": {"sims": 2000, "temperature": 0.0},
-    "ultra": {"sims": 4096, "temperature": 0.0},
+    # leaf: leaves evaluated per network call. 1 = exact sequential PUCT --
+    # required at tiny sim counts, where virtual-loss parallelism would flatten
+    # the whole search. 32 = batched search for the deep levels: ~7x the
+    # simulations in the same wall time (validated by an equal-time match).
+    "beginner": {"sims": 24, "temperature": 1.0, "leaf": 1},
+    "easy": {"sims": 96, "temperature": 0.6, "leaf": 1},
+    "medium": {"sims": 1024, "temperature": 0.0, "leaf": 32},
+    "hard": {"sims": 4096, "temperature": 0.0, "leaf": 32},
+    "max": {"sims": 12288, "temperature": 0.0, "leaf": 32},
+    "ultra": {"sims": 32768, "temperature": 0.0, "leaf": 32},
 }
 # Levels that play at full strength from move one (no opening variety noise).
 FULL_STRENGTH_LEVELS = ("max", "ultra")
+FAST_LEAF_BATCH = 32
+# Searches at or above this many sims route to the leaf-batched tree.
+FAST_SIMS_THRESHOLD = 512
 MAX_SIMS = max(int(cfg["sims"]) for cfg in LEVELS.values())
 
-EVAL_SIMS = 192   # coach-mode evaluation search, precomputed per human turn
-HINT_SIMS = 800   # explicit hint requests get a deeper look
+EVAL_SIMS = 192    # coach-mode evaluation search, precomputed per human turn
+HINT_SIMS = 4096   # explicit hint requests get a deep (leaf-batched) look
 
 # Opening variety: sample lightly for the first few plies so the engine does not
 # play the identical opening every game (except at full strength).
@@ -92,8 +99,15 @@ class GameSession:
 
     def __init__(self, evaluator, seed: int = 0):
         self.lock = threading.RLock()
-        self.mcts = BatchedMCTS(
-            evaluator, n_games=1, max_nodes=MAX_SIMS + 128, seed=seed
+        # Two search instances over the same network: an exact sequential one
+        # for tiny searches (weak levels, coach evals) and a leaf-batched one
+        # for deep searches. See LEVELS for why both exist.
+        self.mcts_precise = BatchedMCTS(
+            evaluator, n_games=1, max_nodes=FAST_SIMS_THRESHOLD + 128, seed=seed
+        )
+        self.mcts_fast = BatchedMCTS(
+            evaluator, n_games=1, max_nodes=MAX_SIMS + 128,
+            leaf_batch=FAST_LEAF_BATCH, seed=seed,
         )
         self.scratch = fr.make_scratch()
         self.rng = np.random.default_rng(seed)
@@ -145,7 +159,8 @@ class GameSession:
     def reload_evaluator(self, evaluator, meta: dict | None = None) -> None:
         """Swap in a newer network (e.g. after a training promotion) mid-session."""
         with self.lock:
-            self.mcts.evaluator = evaluator
+            self.mcts_precise.evaluator = evaluator
+            self.mcts_fast.evaluator = evaluator
             self.meta = meta or {}
 
     # ----------------------------------------------------------------- moves
@@ -358,8 +373,9 @@ class GameSession:
         Returns ``(chosen_action, root_value, visits)`` with the value from the
         side-to-move's perspective.
         """
-        visits = self.mcts.search(self.state.reshape(1, -1).copy(), int(sims))[0]
-        value = float(self.mcts.root_value()[0])
+        mcts = self.mcts_fast if sims >= FAST_SIMS_THRESHOLD else self.mcts_precise
+        visits = mcts.search(self.state.reshape(1, -1).copy(), int(sims))[0]
+        value = float(mcts.root_value()[0])
         if temperature > 1e-3 and visits.sum() > 0:
             p = np.power(visits, 1.0 / temperature)
             p = p / p.sum()

@@ -142,6 +142,132 @@ def _select_batch(
         path_len[g] = depth
 
 
+@njit(cache=True)
+def _select_multi(
+    node_state, node_legal, node_P, node_N, node_W, node_child, node_terminal,
+    node_count, path_node, path_action, path_len, leaf_state, leaf_node,
+    needs_eval, leaf_value, scratch, c_puct, fpu_reduction, max_nodes,
+    n_collect, vloss, root,
+):
+    """Collect ``n_collect`` leaves from ONE tree in a single pass.
+
+    A one-game search otherwise evaluates a single leaf per network call, which
+    on a 9x9 board is pure overhead: the GPU is idle and the per-simulation
+    Python round trip dominates. Gathering many leaves per call amortises both.
+
+    Divergence between the collected paths comes from *virtual loss*: each edge
+    on a path is provisionally credited with a loss as it is traversed, so the
+    next descent sees those moves as less attractive and explores elsewhere.
+    The provisional loss is removed during backup. This is the standard
+    AlphaZero/Leela parallelisation; it changes which leaves get visited within
+    a batch, not the underlying PUCT rule.
+    """
+    for k in range(n_collect):
+        node = root
+        depth = 0
+        needs_eval[k] = 0
+        leaf_value[k] = 0.0
+        leaf_node[k] = -1
+
+        while True:
+            if node_terminal[node] >= 0:
+                leaf_value[k] = -1.0
+                leaf_node[k] = node
+                break
+
+            total = 0.0
+            wsum = 0.0
+            visited_prior = 0.0
+            for a in range(NUM_ACTIONS):
+                na = node_N[node, a]
+                total += na
+                if na > 0.0:
+                    wsum += node_W[node, a]
+                    visited_prior += node_P[node, a]
+            parent_q = wsum / total if total > 0.0 else 0.0
+            fpu_val = parent_q - fpu_reduction * np.sqrt(visited_prior)
+            sqrt_total = np.sqrt(total) if total > 1.0 else 1.0
+
+            best_a = -1
+            best_s = -1e30
+            for a in range(NUM_ACTIONS):
+                if node_legal[node, a] == 0:
+                    continue
+                n = node_N[node, a]
+                q = node_W[node, a] / n if n > 0.0 else fpu_val
+                u = c_puct * node_P[node, a] * sqrt_total / (1.0 + n)
+                s = q + u
+                if s > best_s:
+                    best_s = s
+                    best_a = a
+            if best_a < 0:
+                break
+
+            # Provisional loss so the next descent in this batch diverges.
+            node_N[node, best_a] += vloss
+            node_W[node, best_a] -= vloss
+            path_node[k, depth] = node
+            path_action[k, depth] = best_a
+            depth += 1
+
+            child = node_child[node, best_a]
+            if child < 0:
+                if node_count[0] >= max_nodes:
+                    break
+                new = node_count[0]
+                node_count[0] += 1
+                for i in range(STATE_SIZE):
+                    node_state[new, i] = node_state[node, i]
+                apply_action(node_state[new], best_a, scratch)
+                for a in range(NUM_ACTIONS):
+                    node_N[new, a] = 0.0
+                    node_W[new, a] = 0.0
+                    node_P[new, a] = 0.0
+                    node_child[new, a] = -1
+                    node_legal[new, a] = 0
+                node_child[node, best_a] = new
+
+                w = winner(node_state[new])
+                node_terminal[new] = w
+                leaf_node[k] = new
+                if w >= 0:
+                    leaf_value[k] = -1.0
+                else:
+                    legal_mask(node_state[new], node_legal[new], scratch)
+                    needs_eval[k] = 1
+                    for i in range(STATE_SIZE):
+                        leaf_state[k, i] = node_state[new, i]
+                break
+
+            node = child
+            if depth >= MAX_DEPTH:
+                break
+        path_len[k] = depth
+
+
+@njit(cache=True)
+def _backup_multi(
+    node_P, node_N, node_W, path_node, path_action, path_len,
+    leaf_node, needs_eval, leaf_value, policy, value, n_collect, vloss,
+):
+    """Remove the provisional losses and apply the real values."""
+    for k in range(n_collect):
+        v = leaf_value[k]
+        if needs_eval[k] != 0:
+            ln = leaf_node[k]
+            for a in range(NUM_ACTIONS):
+                node_P[ln, a] = policy[k, a]
+            v = value[k]
+        for i in range(path_len[k] - 1, -1, -1):
+            n = path_node[k, i]
+            a = path_action[k, i]
+            node_N[n, a] -= vloss
+            node_W[n, a] += vloss
+            v = -v  # flip to the perspective of the mover one ply up
+            node_N[n, a] += 1.0
+            node_W[n, a] += v
+
+
 @njit(cache=True, parallel=True)
 def _backup_batch(
     node_P, node_N, node_W, path_node, path_action, path_len,
@@ -218,9 +344,16 @@ class BatchedMCTS:
         dirichlet_alpha: float = 0.15,
         dirichlet_frac: float = 0.25,
         seed: int = 0,
+        leaf_batch: int = 1,
+        virtual_loss: float = 1.0,
     ):
         self.evaluator = evaluator
         self.G = n_games
+        # Leaves gathered per network call when searching a single game. Only
+        # used for n_games == 1; multi-game self-play already batches across
+        # games and needs no virtual loss.
+        self.leaf_batch = max(1, int(leaf_batch)) if n_games == 1 else 1
+        self.virtual_loss = float(virtual_loss)
         self.max_nodes = max_nodes
         self.c_puct = c_puct
         self.fpu_reduction = fpu_reduction
@@ -247,14 +380,34 @@ class BatchedMCTS:
         self.needs_eval = np.zeros(G, dtype=np.uint8)
         self.leaf_value = np.zeros(G, dtype=np.float32)
 
-        self.scratch_all = np.zeros((G, SCRATCH_SIZE), dtype=np.int32)
-        self.d0_all = np.zeros((G, 81), dtype=np.int32)
-        self.d1_all = np.zeros((G, 81), dtype=np.int32)
-        self.canon_all = np.zeros((G, STATE_SIZE), dtype=np.uint8)
-        self.planes = np.zeros((G, NUM_PLANES, 9, 9), dtype=np.float32)
-        self.legal_canon = np.zeros((G, A), dtype=np.uint8)
-        self.flipped = np.zeros(G, dtype=np.uint8)
+        # Encoding buffers must cover the larger of the game count and the
+        # per-call leaf batch, since both feed _evaluate.
+        E = max(G, self.leaf_batch)
+        self.scratch_all = np.zeros((E, SCRATCH_SIZE), dtype=np.int32)
+        self.d0_all = np.zeros((E, 81), dtype=np.int32)
+        self.d1_all = np.zeros((E, 81), dtype=np.int32)
+        self.canon_all = np.zeros((E, STATE_SIZE), dtype=np.uint8)
+        self.planes = np.zeros((E, NUM_PLANES, 9, 9), dtype=np.float32)
+        self.legal_canon = np.zeros((E, A), dtype=np.uint8)
+        self.flipped = np.zeros(E, dtype=np.uint8)
         self._rot = ROT180_ACTION.astype(np.int32)
+
+        if self.leaf_batch > 1:
+            L = self.leaf_batch
+            self.m_path_node = np.zeros((L, MAX_DEPTH), dtype=np.int32)
+            self.m_path_action = np.zeros((L, MAX_DEPTH), dtype=np.int32)
+            self.m_path_len = np.zeros(L, dtype=np.int32)
+            self.m_leaf_state = np.zeros((L, STATE_SIZE), dtype=np.uint8)
+            self.m_leaf_node = np.zeros(L, dtype=np.int32)
+            self.m_needs = np.zeros(L, dtype=np.uint8)
+            self.m_leaf_value = np.zeros(L, dtype=np.float32)
+            # Evaluation is always done at exactly this batch size, padding
+            # unused slots. The number of leaves actually needing a network
+            # call varies (terminal leaves need none), and a varying batch
+            # shape makes cuDNN re-autotune on every call and defeats CUDA
+            # graph capture -- measured at 300 ms/call versus ~2 ms.
+            self.m_eval_state = np.zeros((L, STATE_SIZE), dtype=np.uint8)
+            self.m_eval_legal = np.zeros((L, A), dtype=np.uint8)
 
     # ------------------------------------------------------------------ core
 
@@ -315,6 +468,9 @@ class BatchedMCTS:
         self._init_roots(states, add_noise, n)
         self._last_n = n
 
+        if n == 1 and self.leaf_batch > 1:
+            return self._search_multileaf(n_sims)
+
         for _ in range(n_sims):
             _select_batch(
                 self.node_state[:n], self.node_legal[:n], self.node_P[:n],
@@ -338,6 +494,42 @@ class BatchedMCTS:
                 self.needs_eval[:n], self.leaf_value[:n], policy, value,
             )
         return self.node_N[:n, 0, :].copy()
+
+    def _search_multileaf(self, n_sims: int) -> np.ndarray:
+        """Single-tree search gathering :attr:`leaf_batch` leaves per network call."""
+        done = 0
+        while done < n_sims:
+            k = min(self.leaf_batch, n_sims - done)
+            _select_multi(
+                self.node_state[0], self.node_legal[0], self.node_P[0],
+                self.node_N[0], self.node_W[0], self.node_child[0],
+                self.node_terminal[0], self.node_count[0:1],
+                self.m_path_node, self.m_path_action, self.m_path_len,
+                self.m_leaf_state, self.m_leaf_node, self.m_needs,
+                self.m_leaf_value, self.scratch_all[0], self.c_puct,
+                self.fpu_reduction, self.max_nodes, k, self.virtual_loss, 0,
+            )
+            idx = np.nonzero(self.m_needs[:k])[0]
+            policy = np.zeros((k, NUM_ACTIONS), dtype=np.float32)
+            value = np.zeros(k, dtype=np.float32)
+            if len(idx):
+                # Pad to a fixed batch so the network always sees one shape.
+                m = len(idx)
+                self.m_eval_state[:m] = self.m_leaf_state[idx]
+                self.m_eval_legal[:m] = self.node_legal[0][self.m_leaf_node[idx]]
+                self.m_eval_state[m:] = self.node_state[0, 0]  # filler: the root
+                self.m_eval_legal[m:] = self.node_legal[0, 0]
+                p, v = self._evaluate(self.m_eval_state, self.m_eval_legal)
+                policy[idx] = p[:m]
+                value[idx] = v[:m]
+            _backup_multi(
+                self.node_P[0], self.node_N[0], self.node_W[0],
+                self.m_path_node, self.m_path_action, self.m_path_len,
+                self.m_leaf_node, self.m_needs, self.m_leaf_value,
+                policy, value, k, self.virtual_loss,
+            )
+            done += k
+        return self.node_N[0:1, 0, :].copy()
 
     def root_value(self) -> np.ndarray:
         """Mean value of the root, from the side-to-move's perspective."""

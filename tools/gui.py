@@ -48,10 +48,13 @@ def _load_evaluator(checkpoint: str, device: str):
     torch.backends.cudnn.benchmark = True
     net, meta = load_checkpoint(path, device)
     meta = {**meta, "checkpoint": path.name, "device": device}
-    # The GUI searches one game, so every simulation is a batch-1 network call;
-    # capturing that shape as a CUDA graph makes the engine ~4x faster per move
-    # with bit-identical outputs.
-    return NetEvaluator(net, device=device, graph_batches=(1,)), meta
+    # Capture CUDA graphs for both shapes the GUI uses: batch 1 for the exact
+    # sequential search (weak levels, coach evals) and the leaf-batch size for
+    # the deep levels' batched search.
+    from quoridor.webgui import FAST_LEAF_BATCH
+
+    return NetEvaluator(net, device=device,
+                        graph_batches=(1, FAST_LEAF_BATCH)), meta
 
 
 class Handler(BaseHTTPRequestHandler):
