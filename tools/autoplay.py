@@ -144,15 +144,24 @@ BOARD_JS = r"""() => {
   // Game over requires a *visible* result element, not a text match anywhere
   // on the page. Matching page text caught a permanently-mounted, hidden
   // "Play again anytime" promo and declared every fresh board finished.
+  // Interactive controls are never a result. A ranked game offers a "Draw"
+  // button mid-game, and treating that as a result made the bridge abandon
+  // games in progress. Only a non-interactive banner counts, plus the one
+  // button that exists solely after a game: Rematch.
   let gameOverLabel = null;
   document.querySelectorAll('div,button,span,h1,h2,h3,p').forEach(el => {
     if (gameOverLabel !== null) return;
     if (el.children.length > 1) return;
     const s = (el.textContent || '').trim();
     if (!s || s.length > 30) return;
-    const isResult =
-      /^(victory|defeat|you win|you won|you lose|you lost|draw)\b/i.test(s) ||
-      /^rematch$/i.test(s);
+    const interactive = el.tagName === 'BUTTON' || el.tagName === 'A' ||
+                        el.getAttribute('role') === 'button' ||
+                        el.closest('button,a,[role="button"]') !== null;
+    const isResult = interactive
+      ? /^rematch$/i.test(s)
+      : (/^(victory|defeat)\b/i.test(s) ||
+         /^you (won|lost|win|lose)\b/i.test(s) ||
+         /^(it'?s a |game )?draw[!.]?$/i.test(s));
     if (!isResult) return;
     const r = el.getBoundingClientRect();
     if (r.width > 0 && r.height > 0) gameOverLabel = s;
@@ -217,6 +226,21 @@ TRAY_TOGGLE_JS = r"""() => {
   if (r.width < 4 || r.height < 4) return null;
   return {cx: r.x + r.width / 2, cy: r.y + r.height / 2,
           text: hit.textContent.trim().slice(0, 40)};
+}"""
+
+LOBBY_READY_JS = r"""() => {
+  // The lobby is identifiable by its Casual/Ranked mode toggle.
+  const b = [...document.querySelectorAll('button')].map(x => x.textContent.trim());
+  return b.includes('Ranked') && b.includes('Casual');
+}"""
+
+RANKED_SELECTED_JS = r"""() => {
+  const b = [...document.querySelectorAll('button')]
+    .find(x => x.textContent.trim() === 'Ranked');
+  if (!b) return false;
+  // The active tab in the segmented control is the filled one.
+  const cls = (b.className || '').toString();
+  return /bg-amber|bg-white|text-white/.test(cls);
 }"""
 
 CLOCKS_JS = r"""() => {
@@ -414,15 +438,28 @@ class Bridge:
 
         Returns True once a board is on screen again.
         """
-        hit = self._click_text((r"back to lobby", r"^lobby$"))
-        if hit is None:
-            # The end screen varies; going to the lobby directly always works.
+        self._click_text((r"back to lobby", r"^lobby$"))
+        # Confirm we actually reached the lobby rather than assuming the click
+        # landed; otherwise the matchmaking button is looked for on a game page.
+        for _ in range(12):
+            self.page.wait_for_timeout(500)
+            if self.page.evaluate(LOBBY_READY_JS):
+                break
+        else:
             self.page.goto(f"{BASE}/", wait_until="domcontentloaded", timeout=45000)
-        self.page.wait_for_timeout(1500)
+            self.page.wait_for_timeout(2000)
+        if not self.page.evaluate(LOBBY_READY_JS):
+            print("  !! could not reach the lobby")
+            return False
 
-        # Make sure the ranked tab is the selected mode, then start matchmaking.
+        # Select the ranked tab and verify it took, so a stray state cannot
+        # quietly queue a casual game.
         self._click_text((r"^ranked$",))
-        self.page.wait_for_timeout(400)
+        self.page.wait_for_timeout(500)
+        if not self.page.evaluate(RANKED_SELECTED_JS):
+            print("  !! could not select the Ranked tab")
+            return False
+
         started = self._click_text((r"find ranked match", r"find match",
                                     r"^play now$"))
         if started is None:
@@ -576,10 +613,17 @@ def play_one_move(bridge: Bridge, engine: Engine, args) -> str:
         print(f"  !! board read failed: {err}")
         return "read-failed"
     if read.game_over:
-        if args.verbose:
-            print(f"  game-over signalled by: "
-                  f"{read.raw.get('gameOverLabel')!r}")
-        return "game-over"
+        # Never abandon a game that is plainly still running: the site only
+        # rings destinations for the side to move, so highlights mean live.
+        if read.our_turn and fr.winner(read.state) < 0:
+            print(f"  ignoring a game-over signal "
+                  f"({read.raw.get('gameOverLabel')!r}) -- it is our turn with "
+                  f"{len(read.highlights)} legal moves, so the game is live")
+        else:
+            if args.verbose:
+                print(f"  game-over signalled by: "
+                      f"{read.raw.get('gameOverLabel')!r}")
+            return "game-over"
     # A finished board can linger on screen with a pawn already home. Searching
     # from a decided position yields no move at all, so treat it as over.
     if fr.winner(read.state) >= 0:
