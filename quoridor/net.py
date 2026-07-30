@@ -128,6 +128,13 @@ class NetEvaluator:
     Masks illegal actions *before* the softmax rather than zeroing probabilities
     afterwards, so the remaining priors keep their relative weighting instead of
     being distorted by probability mass assigned to impossible moves.
+
+    ``graph_batches`` captures the forward pass as a CUDA graph for those exact
+    batch sizes. At batch 1 -- the interactive-play case, where one game means
+    one position per simulation -- eager execution is dominated by Python and
+    kernel-launch overhead, and a graph replay of the identical kernels is
+    several times faster. The network, weights, and outputs are unchanged; only
+    the launch mechanism differs. Other batch sizes fall through to eager.
     """
 
     def __init__(
@@ -136,6 +143,7 @@ class NetEvaluator:
         device: str = "cuda",
         use_amp: bool = True,
         channels_last: bool = True,
+        graph_batches: tuple[int, ...] = (),
     ):
         self.net = net.to(device).eval()
         self.device = device
@@ -143,7 +151,36 @@ class NetEvaluator:
         self.channels_last = channels_last and device.startswith("cuda")
         if self.channels_last:
             self.net = self.net.to(memory_format=torch.channels_last)
-        self._planes_buf: torch.Tensor | None = None
+        self._graphs: dict[int, tuple] = {}
+        if device.startswith("cuda"):
+            for b in graph_batches:
+                self._capture(b)
+
+    def _forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.use_amp):
+            return self.net(x)
+
+    def _capture(self, batch: int) -> None:
+        """Record the forward pass for a fixed batch size as a CUDA graph."""
+        static_in = torch.zeros(
+            batch, self.net.cfg.planes, 9, 9, device=self.device
+        )
+        if self.channels_last:
+            static_in = static_in.contiguous(memory_format=torch.channels_last)
+
+        # Standard capture recipe: warm up on a side stream first so cuDNN
+        # autotuning and lazy init don't end up inside the recording.
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side), torch.inference_mode():
+            for _ in range(3):
+                self._forward(static_in)
+        torch.cuda.current_stream().wait_stream(side)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.inference_mode(), torch.cuda.graph(graph):
+            static_logits, static_value = self._forward(static_in)
+        self._graphs[batch] = (graph, static_in, static_logits, static_value)
 
     @torch.inference_mode()
     def evaluate(
@@ -157,8 +194,14 @@ class NetEvaluator:
         if self.channels_last:
             x = x.contiguous(memory_format=torch.channels_last)
 
-        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.use_amp):
-            logits, value = self.net(x)
+        entry = self._graphs.get(x.shape[0])
+        if entry is not None:
+            graph, static_in, static_logits, static_value = entry
+            static_in.copy_(x)
+            graph.replay()
+            logits, value = static_logits, static_value
+        else:
+            logits, value = self._forward(x)
 
         logits = logits.float()
         mask = torch.from_numpy(legal).to(self.device).bool()

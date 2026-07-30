@@ -258,9 +258,21 @@ class GameSession:
                 self.result = int(w)
                 self.current_eval = 1.0 if w == self.human else -1.0
                 return
-            # Precompute the coach eval for the human's next turn while they
-            # are still looking at the engine's move.
-            self._prepare_turn()
+            # Precompute the coach eval for the human's next turn -- but off the
+            # reply's critical path, so the engine's move renders as soon as its
+            # own search finishes. If the human moves before this lands,
+            # human_move's fallback computes it synchronously, same as before.
+            threading.Thread(
+                target=self._prepare_turn_async, args=(len(self.log),), daemon=True
+            ).start()
+
+    def _prepare_turn_async(self, expected_ply: int) -> None:
+        with self.lock:
+            # The position may have changed while this thread waited on the
+            # lock (fast human move, undo, new game) -- only fill the cache if
+            # it is still the same turn it was scheduled for.
+            if len(self.log) == expected_ply and self._turn_eval is None:
+                self._prepare_turn()
 
     def takeback(self) -> None:
         """Undo back to the most recent earlier position where it is the human's turn."""
