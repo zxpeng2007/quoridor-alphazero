@@ -27,6 +27,13 @@ def session():
     return s
 
 
+def play(session, action):
+    """One full exchange: the human's move plus the engine's (separate) reply."""
+    session.human_move(action)
+    if session.result is None:
+        session.engine_reply()
+
+
 # ----------------------------------------------------------------- basics
 
 
@@ -39,16 +46,31 @@ def test_new_game_human_first(session):
     assert len(snap["legal_walls"]) == 128
 
 
-def test_new_game_engine_first(session):
+def test_new_game_engine_first_defers_reply(session):
+    """The engine's opening move is NOT played inside new_game: the client asks
+    for it separately so the fresh board renders before the engine thinks."""
     session.new_game(human_player=1, level="beginner")
     snap = session.snapshot()
-    assert snap["ply"] == 1, "engine should have moved immediately"
+    assert snap["ply"] == 0
+    assert snap["needs_reply"] is True
+    session.engine_reply()
+    snap = session.snapshot()
+    assert snap["ply"] == 1
     assert snap["turn"] == 1 == snap["human_player"]
+    assert snap["needs_reply"] is False
     assert snap["log"][0]["actor"] == "engine"
 
 
-def test_human_move_gets_engine_reply(session):
-    session.human_move(129)  # S
+def test_human_move_returns_before_engine_reply(session):
+    session.human_move(129)  # S -- must return with only the human move applied
+    snap = session.snapshot()
+    assert snap["ply"] == 1
+    assert snap["turn"] == 1, "engine to move"
+    assert snap["needs_reply"] is True
+    assert snap["log"][0]["eval"] is None, "eval settles when the reply lands"
+    assert snap["legal_moves"] == [], "no input while the engine owes a move"
+
+    session.engine_reply()
     snap = session.snapshot()
     assert snap["ply"] == 2
     assert snap["turn"] == 0, "after the engine reply it is the human's turn again"
@@ -56,10 +78,20 @@ def test_human_move_gets_engine_reply(session):
     assert snap["log"][0]["eval"] is not None, "coach mode should record an eval"
 
 
+def test_engine_reply_is_idempotent(session):
+    """Duplicate /api/reply (double request, refresh mid-reply) must be a no-op."""
+    session.engine_reply()  # human to move: nothing should happen
+    assert session.snapshot()["ply"] == 0
+    play(session, 129)
+    before = session.snapshot()
+    session.engine_reply()  # human to move again: still a no-op
+    assert session.snapshot()["ply"] == before["ply"]
+
+
 def test_illegal_moves_rejected(session):
     with pytest.raises(ValueError):
         session.human_move(128)  # N from (0,4) is off the board
-    session.human_move(129)
+    play(session, 129)
     with pytest.raises(ValueError):
         session.human_move(9999)
 
@@ -75,8 +107,8 @@ def test_wall_move_spends_a_wall(session):
 
 
 def test_takeback_returns_to_human_turn(session):
-    session.human_move(129)
-    session.human_move(129)
+    play(session, 129)
+    play(session, 129)
     assert session.snapshot()["ply"] == 4
     session.takeback()
     snap = session.snapshot()
@@ -141,9 +173,10 @@ def test_hint_returns_legal_top_moves(session):
 
 def test_coach_off_skips_pre_eval(session):
     session.set_config(coach=False)
-    session.human_move(129)
+    play(session, 129)
     entry = session.snapshot()["log"][0]
     assert entry["tag"] is None and entry["best"] is None
+    assert entry["eval"] is not None, "the reply search still provides an eval"
 
 
 def test_level_change_mid_game(session):
@@ -157,7 +190,7 @@ def test_level_change_mid_game(session):
 
 
 def test_snapshot_is_json_serializable(session):
-    session.human_move(129)
+    play(session, 129)
     text = json.dumps(session.snapshot())
     assert "legal_moves" in text
 
@@ -174,7 +207,7 @@ def test_engine_moves_are_legal_over_a_full_game(session):
         assert moves, "human should always have a pawn move"
         # Prefer advancing so games finish inside the loop budget.
         best = min(moves, key=lambda m: abs(m["dest"] // 9 - 8))
-        session.human_move(best["action"])
+        play(session, best["action"])
     assert session.snapshot()["ply"] > 4
 
 

@@ -93,6 +93,8 @@ class Handler(BaseHTTPRequestHandler):
                 )
             elif self.path == "/api/move":
                 _session.human_move(int(body["action"]))
+            elif self.path == "/api/reply":
+                _session.engine_reply()  # slow call; idempotent if not engine's turn
             elif self.path == "/api/takeback":
                 _session.takeback()
             elif self.path == "/api/resign":

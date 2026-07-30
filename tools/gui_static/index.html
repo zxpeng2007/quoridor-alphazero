@@ -549,11 +549,23 @@ function toast(msg) {
   t._timer = setTimeout(() => t.classList.remove("show"), 2600);
 }
 
+async function ensureReply() {
+  // The engine's move is a separate slow request so the human's own move (or a
+  // fresh board) renders first. Server-side engine_reply is idempotent, so a
+  // duplicate call after a refresh is harmless.
+  if (S.state && S.state.pawns && S.state.needs_reply) {
+    await api("/api/reply", {});
+  }
+}
+
 async function move(action) {
   if (S.busy || !S.state || S.state.result !== null) return;
   S.busy = true; S.hint = null; render();
-  try { await api("/api/move", { action }); }
-  finally { S.busy = false; render(); }
+  try {
+    await api("/api/move", { action });
+    render();          // your move appears immediately, engine still thinking
+    await ensureReply();
+  } finally { S.busy = false; render(); }
 }
 
 async function newGame() {
@@ -564,6 +576,8 @@ async function newGame() {
       human_player: +document.getElementById("sideSel").value,
       level: document.getElementById("levelSel").value,
     });
+    render();          // show the fresh board before the engine's first move
+    await ensureReply();
   } finally { S.busy = false; render(); }
 }
 
@@ -627,7 +641,16 @@ document.addEventListener("keydown", e => {
 
 /* ----------------------------------------------------------------- init */
 buildBoard();
-api("/api/state").then(render);
+(async () => {
+  await api("/api/state");
+  render();
+  // If the page was refreshed while the engine owed a move, resume it.
+  if (S.state && S.state.needs_reply) {
+    S.busy = true; render();
+    try { await ensureReply(); }
+    finally { S.busy = false; render(); }
+  }
+})();
 </script>
 </body>
 </html>
