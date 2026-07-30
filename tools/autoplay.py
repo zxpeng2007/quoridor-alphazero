@@ -152,15 +152,40 @@ BOARD_JS = r"""() => {
 
 TRAY_JS = r"""() => {
   // The two draggable barricade pieces; the wide one places horizontal walls.
+  // Identify them by the grab cursor rather than by role, and require they be
+  // visible -- the tray lives in a collapsible panel that some views start
+  // closed, in which case the pieces are absent or zero-sized.
   const out = [];
-  document.querySelectorAll('[role="button"]').forEach(el => {
-    if (getComputedStyle(el).cursor !== 'grab') return;
+  document.querySelectorAll('div,button,span').forEach(el => {
+    const st = getComputedStyle(el);
+    const cls = (el.className || '').toString();
+    const grabby = st.cursor === 'grab' || st.cursor === 'grabbing' ||
+                   cls.includes('cursor-grab');
+    if (!grabby) return;
+    if (st.visibility === 'hidden' || st.display === 'none') return;
     const r = el.getBoundingClientRect();
     if (r.width < 8 || r.height < 8) return;
+    if (Math.abs(r.width - r.height) < 4) return;   // need a clear orientation
     out.push({horizontal: r.width > r.height,
-              cx: r.x + r.width / 2, cy: r.y + r.height / 2});
+              cx: r.x + r.width / 2, cy: r.y + r.height / 2,
+              w: Math.round(r.width), h: Math.round(r.height)});
   });
-  return out;
+  // Prefer the outermost container per orientation (largest of each).
+  const pick = (horiz) => out.filter(t => t.horizontal === horiz)
+                             .sort((a, b) => (b.w * b.h) - (a.w * a.h))[0];
+  return [pick(true), pick(false)].filter(Boolean);
+}"""
+
+TRAY_TOGGLE_JS = r"""() => {
+  // The panel header that expands the barricade tray, if it is collapsed.
+  const btns = [...document.querySelectorAll('button,[role="button"]')];
+  const hit = btns.find(b => /barricade/i.test((b.textContent || '').trim())
+                             && (b.textContent || '').trim().length < 60);
+  if (!hit) return null;
+  const r = hit.getBoundingClientRect();
+  if (r.width < 4 || r.height < 4) return null;
+  return {cx: r.x + r.width / 2, cy: r.y + r.height / 2,
+          text: hit.textContent.trim().slice(0, 40)};
 }"""
 
 CLOCKS_JS = r"""() => {
@@ -332,6 +357,25 @@ class Bridge:
         self.page.mouse.click(target[0], target[1])
         return True
 
+    def _tray_piece(self, want_horizontal: bool) -> dict | None:
+        """Locate a draggable barricade piece, expanding the tray if collapsed."""
+        for attempt in range(2):
+            hits = [t for t in self.page.evaluate(TRAY_JS)
+                    if t["horizontal"] == want_horizontal]
+            if hits:
+                return hits[0]
+            if attempt == 0:
+                toggle = self.page.evaluate(TRAY_TOGGLE_JS)
+                if toggle is None:
+                    break
+                print(f"  (expanding barricade tray: {toggle['text']!r})")
+                self.page.mouse.click(toggle["cx"], toggle["cy"])
+                self.page.wait_for_timeout(700)
+        print("  !! could not find the barricade tray piece to drag "
+              f"({'horizontal' if want_horizontal else 'vertical'}). "
+              "Open the 'Drag & Drop Barricades' panel in the browser and retry.")
+        return None
+
     def play_wall(self, action: int, flipped: bool) -> bool:
         """Place a wall by dragging the matching tray piece onto the slot.
 
@@ -355,12 +399,9 @@ class Bridge:
         if not box:
             return False
 
-        tray = [t for t in self.page.evaluate(TRAY_JS)
-                if t["horizontal"] == want_horizontal]
-        if not tray:
-            print("  !! could not find the barricade tray piece to drag")
+        src = self._tray_piece(want_horizontal)
+        if src is None:
             return False
-        src = tray[0]
         tx, ty = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
 
         # dnd-kit ignores a teleporting cursor; it needs real intermediate moves.
