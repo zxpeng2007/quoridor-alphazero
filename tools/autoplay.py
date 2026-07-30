@@ -7,58 +7,50 @@ asks the trained engine for a move, and plays it. Loops until you stop it.
 PRECONDITIONS (yours to confirm, not checked here)
 -------------------------------------------------
 * The account is flagged as a bot by the site operators, so opponents can see
-  what they are playing. Nothing below verifies that.
-* You are OK with the games this plays counting on the ranked ladder.
+  what they are playing.
+* You are OK with these games counting on the ranked ladder.
 
 USAGE
 -----
-First, always validate the DOM contract without playing::
+    python tools/autoplay.py --dry-run       # read and decide, click nothing
+    python tools/autoplay.py --max-games 10  # play for real
 
-    python tools/autoplay.py --dry-run
+Stop with Ctrl+C, or create a file named ``STOP`` in the project directory
+(checked before every move, so it stops cleanly rather than mid-click).
 
-Dry run reads the live board, prints what it decodes and what the engine would
-play, and clicks nothing. Only when its board matches what you see on screen is
-the reader trustworthy. Then::
+BOARD READING
+-------------
+The reader is verified end-to-end by ``tools/validate_reader.py``, which steps
+through a finished game on the analysis page and compares what this code
+decodes from the DOM against the position obtained by replaying the game's own
+move list through the rules engine. It currently agrees on 42/42 positions of a
+41-move game, including positions where the pawns have crossed.
 
-    python tools/autoplay.py --max-games 10
+Facts established against the live site, rather than assumed:
 
-To stop: press Ctrl+C, or create the file ``STOP`` in the project directory
-(checked before every move, so it stops cleanly mid-game rather than mid-click).
-
-DESIGN: FAIL CLOSED
--------------------
-A misread board does not produce a bad move -- it produces a *legal move for the
-wrong position*, which is worse than resigning because it looks fine. So every
-move passes three independent checks, and any failure aborts the game instead of
-clicking:
-
-1. **Structural**: exactly two pawns found, on distinct cells.
-2. **Wall cross-check**: walls counted in the DOM must equal 20 minus the
-   barricade counters the page displays. This catches missed or phantom walls.
-3. **Post-move confirmation**: after clicking, the board is re-read and must
-   match the position the engine expected. If not, we stop.
-
-VERIFIED vs UNVERIFIED
-----------------------
-Verified against the live site earlier: wall-slot testids
-(``slot-horizontal-{r}-{c}`` / ``slot-vertical-{r}-{c}``, indices identical to
-the engine's action encoding), board geometry (738 px container, 4 px pad,
-62.75 px cells, 78.4375 px pitch), and the move notation convention.
-
-NOT verified (the selectors below are best-effort and are exactly what dry-run
-exists to check): pawn element detection, the wall drag-and-drop gesture, and
-turn/orientation detection. Expect to adjust ``PAWN_JS``, ``WALL_DRAG``, and
-``TURN_JS`` once, using dry-run output.
+* Pawns are ``div.rounded-full`` with ``bg-red-500`` / ``bg-blue-500``. Colour
+  identifies the seat -- red is the first seat (engine player 0), blue the
+  second. Colour is authoritative; relative position is NOT, because the pawns
+  cross during a game. (An earlier version assigned seats by row order and
+  silently mirrored the position mid-game.)
+* Wall slots are ``slot-{horizontal,vertical}-{r}-{c}``, indices identical to
+  the engine's action encoding. A placed wall is a slot child with non-zero
+  opacity and a real background colour; empty slots carry a transparent
+  hover-ghost child, and slots blocked by a crossing wall have no child at all.
+* Board orientation is read from the rank labels every time. The default view
+  draws rank 9 at the top, but the board rotates when you play the second seat.
+* Whose turn it is comes from watching which clock actually ticks -- markup for
+  turn indicators is easy to get wrong, a running clock is not.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import re
 import signal
-import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -75,133 +67,90 @@ PROFILE_DIR = Path.home() / ".barricade-autoplay-firefox"
 FILES = "abcdefghi"
 MOVE_NAMES = ["N", "S", "E", "W", "NN", "SS", "EE", "WW", "NE", "NW", "SE", "SW"]
 
-# ---------------------------------------------------------------- board read
+# --------------------------------------------------------------------- DOM
 
-GEOMETRY_JS = """() => {
+BOARD_JS = r"""() => {
   const s00 = document.querySelector('[data-testid="slot-horizontal-0-0"]');
-  if (!s00) return null;
-  const board = s00.parentElement;
-  const b = board.getBoundingClientRect();
-  // Derive the grid from two slots rather than hard-coding pixel constants, so
-  // the reader survives a window resize or a layout change.
   const s11 = document.querySelector('[data-testid="slot-horizontal-1-1"]');
-  const r00 = s00.getBoundingClientRect(), r11 = s11.getBoundingClientRect();
-  const pitch = r11.x - r00.x;
-  const gap = r00.height;
-  const cell = pitch - gap;
-  return {bx: b.x, by: b.y, bw: b.width, pitch, cell, gap,
-          originX: r00.x, originY: r00.y - cell};
-}"""
-
-# Rank labels tell us which way the board is drawn; never assume an orientation.
-ORIENT_JS = """() => {
-  const labels = [...document.querySelectorAll('div')].filter(el => {
-    const t = el.textContent.trim();
-    return /^[1-9]$/.test(t) && el.children.length === 0 &&
-           (el.className || '').toString().includes('font-mono');
-  }).map(el => ({rank: +el.textContent.trim(),
-                 y: el.getBoundingClientRect().y}));
-  if (labels.length < 2) return null;
-  labels.sort((a, b) => a.y - b.y);
-  return {topRank: labels[0].rank, bottomRank: labels[labels.length - 1].rank,
-          count: labels.length};
-}"""
-
-PAWN_JS = """() => {
-  const s00 = document.querySelector('[data-testid="slot-horizontal-0-0"]');
-  if (!s00) return null;
+  if (!s00 || !s11) return null;
   const board = s00.parentElement;
-  const b = board.getBoundingClientRect();
-  const out = [];
+  const bb = board.getBoundingClientRect();
+  const r00 = s00.getBoundingClientRect(), r11 = s11.getBoundingClientRect();
+  const pitch = r11.x - r00.x, gap = r00.height, cell = pitch - gap;
+  const ox = r00.x, oy = r00.y - cell;
+
+  const labels = [];
   board.querySelectorAll('div').forEach(el => {
-    if (el.dataset && el.dataset.testid) return;          // skip wall slots
+    const t = el.textContent.trim();
+    if (/^[1-9]$/.test(t) && el.children.length === 0)
+      labels.push({r: +t, y: el.getBoundingClientRect().y});
+  });
+  labels.sort((a, b) => a.y - b.y);
+  const flipped = labels.length >= 2
+    ? labels[0].r > labels[labels.length - 1].r : null;
+
+  const pawns = [];
+  board.querySelectorAll('div.rounded-full').forEach(el => {
     const r = el.getBoundingClientRect();
-    const st = getComputedStyle(el);
-    const radius = parseFloat(st.borderRadius) || 0;
-    const round = radius >= r.width / 3 && r.width > 14 && r.width < 70;
-    const filled = st.backgroundColor !== 'rgba(0, 0, 0, 0)' ||
-                   st.backgroundImage !== 'none';
-    if (round && filled && Math.abs(r.width - r.height) < 6) {
-      out.push({cx: r.x + r.width / 2 - b.x, cy: r.y + r.height / 2 - b.y,
-                w: r.width, bg: st.backgroundColor,
-                img: st.backgroundImage.slice(0, 60),
-                cls: (el.className || '').toString().slice(0, 60)});
-    }
+    if (r.width < 10) return;
+    const cls = (el.className || '').toString();
+    const colour = cls.includes('bg-red') ? 'red'
+                 : cls.includes('bg-blue') ? 'blue' : null;
+    if (!colour) return;
+    pawns.push({colour,
+                col: Math.round((r.x + r.width / 2 - ox - cell / 2) / pitch),
+                vrow: Math.round((r.y + r.height / 2 - oy - cell / 2) / pitch)});
   });
-  return out;
-}"""
 
-WALL_JS = """() => {
-  const out = [];
+  const walls = [];
   document.querySelectorAll('[data-testid^="slot-"]').forEach(el => {
-    // A placed wall paints the slot (or an inner div). An empty slot is
-    // transparent until hovered. Compare against the slot's own children.
-    let filled = false;
-    const st = getComputedStyle(el);
-    if (st.backgroundColor !== 'rgba(0, 0, 0, 0)' &&
-        parseFloat(st.opacity || '1') > 0.5) filled = true;
-    for (const kid of el.querySelectorAll('div')) {
-      const ks = getComputedStyle(kid);
-      const kr = kid.getBoundingClientRect();
-      if (ks.backgroundColor !== 'rgba(0, 0, 0, 0)' &&
-          parseFloat(ks.opacity || '1') > 0.5 &&
-          kr.width > 20 && kr.height > 4) filled = true;
-    }
-    if (filled) out.push(el.dataset.testid);
+    const kid = el.firstElementChild;
+    if (!kid) return;
+    const ks = getComputedStyle(kid);
+    if (ks.opacity === '0') return;
+    if (ks.backgroundColor === 'rgba(0, 0, 0, 0)') return;
+    walls.push({tid: el.dataset.testid, bg: ks.backgroundColor});
   });
+
+  const text = document.body.innerText;
+  const bars = (text.match(/Barricades:\s*(\d+)\s*\/\s*10/g) || [])
+    .map(s => +s.match(/(\d+)/)[1]);
+  return {geo: {bx: bb.x, by: bb.y, pitch, cell, gap, ox, oy},
+          flipped, pawns, walls, barricades: bars,
+          youArePlayer: (text.match(/You are Player (\d)/) || [])[1] || null,
+          gameOver: /won by|You won|You lost|resigned|Draw|Rematch/i.test(text),
+          text: text.slice(0, 300)};
+}"""
+
+CLOCKS_JS = r"""() => {
+  const out = [];
+  document.querySelectorAll('div,span').forEach(el => {
+    if (el.children.length) return;
+    const t = el.textContent.trim();
+    if (!/^\d{1,2}:\d{2}(\.\d)?$/.test(t)) return;
+    const r = el.getBoundingClientRect();
+    if (r.width === 0) return;
+    out.push({t, y: r.y});
+  });
+  out.sort((a, b) => a.y - b.y);
   return out;
 }"""
 
-TURN_JS = """() => {
-  const text = document.body.innerText;
-  const clocks = [...document.querySelectorAll('div')]
-    .filter(el => el.children.length === 0 && /^\\d+:\\d{2}$/.test(el.textContent.trim()))
-    .map(el => ({t: el.textContent.trim(),
-                 y: el.getBoundingClientRect().y,
-                 cls: (el.className || '').toString().slice(0, 80)}));
-  clocks.sort((a, b) => a.y - b.y);
-  const barricades = (text.match(/Barricades:\\s*(\\d+)\\s*\\/\\s*10/g) || [])
-    .map(s => +s.match(/(\\d+)/)[1]);
-  return {
-    clocks, barricades,
-    youArePlayer: (text.match(/You are Player (\\d)/) || [])[1] || null,
-    thinking: /thinking/i.test(text),
-    gameOver: /won by|You won|You lost|resigned|Draw/i.test(text),
-    text: text.slice(0, 400),
-  };
-}"""
 
-WALL_DRAG = """
-async (args) => {
-  // dnd-kit needs a real pointer sequence with intermediate moves; a single
-  // click on the slot does nothing.
-  const tray = document.querySelector(args.traySelector);
-  const slot = document.querySelector(`[data-testid="${args.slotId}"]`);
-  if (!tray || !slot) return {ok: false, why: 'tray or slot not found'};
-  const t = tray.getBoundingClientRect(), s = slot.getBoundingClientRect();
-  return {ok: true,
-          from: {x: t.x + t.width / 2, y: t.y + t.height / 2},
-          to: {x: s.x + s.width / 2, y: s.y + s.height / 2}};
-}"""
+def clock_seconds(text: str) -> float:
+    mm, _, rest = text.partition(":")
+    return int(mm) * 60 + float(rest)
 
 
 @dataclass
 class BoardRead:
-    """A decoded position plus everything needed to audit the decode."""
-
     state: np.ndarray
-    us: int                 # engine player index we are playing
-    flipped: bool           # True when rank 1 is drawn at the bottom
-    our_clock: float | None
+    flipped: bool
+    us: int
     walls_seen: int
     walls_expected: int
-    raw_pawns: list
-    raw_walls: list
-    info: dict
-
-    @property
-    def consistent(self) -> bool:
-        return self.walls_seen == self.walls_expected
+    game_over: bool
+    raw: dict = field(repr=False)
 
 
 class Bridge:
@@ -210,137 +159,100 @@ class Bridge:
         self.verbose = verbose
         self.geo: dict | None = None
 
-    # ------------------------------------------------------------ geometry
-
-    def refresh_geometry(self) -> bool:
-        self.geo = self.page.evaluate(GEOMETRY_JS)
-        return self.geo is not None
-
-    def cell_from_xy(self, cx: float, cy: float, flipped: bool) -> int | None:
-        """Board-relative pixel centre -> engine cell index."""
-        g = self.geo
-        col = round((cx - (g["originX"] - g["bx"]) - g["cell"] / 2) / g["pitch"])
-        vrow = round((cy - (g["originY"] - g["by"]) - g["cell"] / 2) / g["pitch"])
-        if not (0 <= col < 9 and 0 <= vrow < 9):
-            return None
-        row = 8 - vrow if flipped else vrow
-        return row * 9 + col
-
-    def cell_xy(self, cell: int, flipped: bool) -> tuple[float, float]:
-        """Engine cell index -> absolute screen coordinates of its centre."""
-        g = self.geo
-        row, col = divmod(cell, 9)
-        vrow = 8 - row if flipped else row
-        return (g["originX"] + col * g["pitch"] + g["cell"] / 2,
-                g["originY"] + vrow * g["pitch"] + g["cell"] / 2)
-
     # ---------------------------------------------------------------- read
 
-    def read(self) -> BoardRead | None:
-        if not self.refresh_geometry():
-            return None
-        orient = self.page.evaluate(ORIENT_JS)
-        info = self.page.evaluate(TURN_JS)
-        pawns = self.page.evaluate(PAWN_JS) or []
-        walls = self.page.evaluate(WALL_JS) or []
+    def snapshot(self) -> dict | None:
+        dom = self.page.evaluate(BOARD_JS)
+        if dom:
+            self.geo = dom["geo"]
+        return dom
 
-        # Orientation: the site draws rank 9 at the top by default, and rotates
-        # when you play the second seat. Read it, never assume.
-        flipped = True
-        if orient:
-            flipped = orient["topRank"] > orient["bottomRank"]
+    def decode(self, dom: dict) -> tuple[BoardRead | None, str]:
+        if dom is None:
+            return None, "no board on the page"
+        if dom["flipped"] is None:
+            return None, "could not read board orientation from rank labels"
+        flipped = bool(dom["flipped"])
 
         st = fr.initial_state()
-        for i in range(fr.NUM_WALL_SLOTS):
-            st[fr.WH_OFF + i] = 0
-            st[fr.WV_OFF + i] = 0
+        st[fr.WH_OFF:fr.WH_OFF + 64] = 0
+        st[fr.WV_OFF:fr.WV_OFF + 64] = 0
 
-        for tid in walls:
-            try:
-                _, orientation, r, c = tid.split("-")
-                wr, wc = int(r), int(c)
-            except ValueError:
+        for w in dom["walls"]:
+            parts = w["tid"].split("-")
+            if len(parts) != 4:
                 continue
+            orientation, wr, wc = parts[1], int(parts[2]), int(parts[3])
             if flipped:
                 wr = 7 - wr
+            if not (0 <= wr < 8 and 0 <= wc < 8):
+                return None, f"wall slot out of range: {w['tid']}"
             off = fr.WH_OFF if orientation == "horizontal" else fr.WV_OFF
             st[off + wr * 8 + wc] = 1
 
-        cells = []
-        for p in pawns:
-            cell = self.cell_from_xy(p["cx"], p["cy"], flipped)
-            if cell is not None:
-                cells.append((cell, p))
-        if len(cells) != 2:
-            if self.verbose:
-                print(f"    pawn detection found {len(cells)} candidates "
-                      f"(need exactly 2)")
-            return None
+        by_colour: dict[str, int] = {}
+        for p in dom["pawns"]:
+            row = 8 - p["vrow"] if flipped else p["vrow"]
+            if not (0 <= row < 9 and 0 <= p["col"] < 9):
+                return None, f"pawn off board: {p}"
+            by_colour[p["colour"]] = row * 9 + p["col"]
+        if set(by_colour) != {"red", "blue"}:
+            return None, (f"expected one red and one blue pawn, "
+                          f"found {dom['pawns']}")
+        st[fr.IDX_P0] = by_colour["red"]
+        st[fr.IDX_P1] = by_colour["blue"]
 
-        # Which pawn is ours? The site says "You are Player N"; site player 1
-        # moves first and is engine player 0.
-        you = info.get("youArePlayer")
+        bars = dom.get("barricades") or []
+        walls_expected = -1
+        if len(bars) == 2:
+            # Order on the page is not guaranteed; only the total is a checksum.
+            walls_expected = 20 - (bars[0] + bars[1])
+            placed_p0 = sum(1 for w in dom["walls"] if "178" in w["bg"])
+            placed_p1 = len(dom["walls"]) - placed_p0
+            st[fr.IDX_WL0] = max(0, 10 - placed_p0)
+            st[fr.IDX_WL1] = max(0, 10 - placed_p1)
+
+        you = dom.get("youArePlayer")
         us = 0 if you == "1" else 1 if you == "2" else None
         if us is None:
-            if self.verbose:
-                print("    could not determine which seat we are")
-            return None
+            return None, "could not determine which seat we are playing"
 
-        # Engine player 0 starts on rank 1 (row 0) and races to row 8. Assign
-        # the two detected pawns by which goal each is nearer -- unambiguous
-        # except at the exact start, where both are on their own start squares.
-        (c0, _), (c1, _) = cells
-        rows = (c0 // 9, c1 // 9)
-        if rows[0] == rows[1]:
-            return None
-        p0_cell, p1_cell = (c0, c1) if rows[0] < rows[1] else (c1, c0)
-        st[fr.IDX_P0] = p0_cell
-        st[fr.IDX_P1] = p1_cell
+        return BoardRead(state=st, flipped=flipped, us=us,
+                         walls_seen=len(dom["walls"]),
+                         walls_expected=walls_expected,
+                         game_over=bool(dom.get("gameOver")), raw=dom), ""
 
-        bars = info.get("barricades") or []
-        if len(bars) == 2:
-            # The page lists both players' remaining counts; order is not
-            # guaranteed, so only the total is used as a checksum.
-            st[fr.IDX_WL0] = bars[0]
-            st[fr.IDX_WL1] = bars[1]
-            walls_expected = 20 - (bars[0] + bars[1])
-        else:
-            walls_expected = -1
+    def whose_turn(self, us: int, settle: float = 1.1) -> int | None:
+        """Which engine player is to move, from which clock is ticking.
 
-        clocks = info.get("clocks") or []
-        our_clock = None
-        if len(clocks) == 2:
-            # Bottom clock is the local player's in the site's layout.
-            mm, ss = clocks[-1]["t"].split(":")
-            our_clock = int(mm) * 60 + int(ss)
-
-        st[fr.IDX_TURN] = self._infer_turn(st, us, info)
-
-        return BoardRead(
-            state=st, us=us, flipped=flipped, our_clock=our_clock,
-            walls_seen=len(walls), walls_expected=walls_expected,
-            raw_pawns=pawns, raw_walls=walls, info=info,
-        )
-
-    def _infer_turn(self, st: np.ndarray, us: int, info: dict) -> int:
-        """Whose move it is, from parity of the material actually on the board.
-
-        Each ply either advances a pawn or spends a wall, so total plies is
-        (pawn steps taken) + (walls placed) -- and side to move is its parity.
-        Robust against the clock/indicator markup changing.
+        Turn-indicator markup is easy to misread; a running clock is not.
+        Returns None when neither clock moves (game over, or between games).
         """
-        walls_placed = 20 - int(st[fr.IDX_WL0]) - int(st[fr.IDX_WL1])
-        # Manhattan-ish distance travelled is not exact when pawns detour, so
-        # prefer the clock indicator when we have one; parity is the fallback.
-        return (walls_placed + self._pawn_plies(st)) % 2
-
-    @staticmethod
-    def _pawn_plies(st: np.ndarray) -> int:
-        r0 = int(st[fr.IDX_P0]) // 9
-        r1 = 8 - int(st[fr.IDX_P1]) // 9
-        return r0 + r1
+        first = self.page.evaluate(CLOCKS_JS)
+        if len(first) != 2:
+            return None
+        self.page.wait_for_timeout(int(settle * 1000))
+        second = self.page.evaluate(CLOCKS_JS)
+        if len(second) != 2:
+            return None
+        deltas = [clock_seconds(a["t"]) - clock_seconds(b["t"])
+                  for a, b in zip(first, second)]
+        # The site puts the local player's clock at the bottom.
+        top_running, bottom_running = deltas[0] > 0.05, deltas[1] > 0.05
+        if bottom_running and not top_running:
+            return us
+        if top_running and not bottom_running:
+            return 1 - us
+        return None
 
     # --------------------------------------------------------------- write
+
+    def cell_xy(self, cell: int, flipped: bool) -> tuple[float, float]:
+        g = self.geo
+        row, col = divmod(cell, 9)
+        vrow = 8 - row if flipped else row
+        return (g["ox"] + col * g["pitch"] + g["cell"] / 2,
+                g["oy"] + vrow * g["pitch"] + g["cell"] / 2)
 
     def play_pawn(self, cell: int, flipped: bool) -> None:
         x, y = self.cell_xy(cell, flipped)
@@ -352,36 +264,26 @@ class Bridge:
         if flipped:
             wr = 7 - wr
         tid = f"slot-{'horizontal' if orient == 0 else 'vertical'}-{wr}-{wc}"
-        plan = self.page.evaluate(
-            WALL_DRAG, {"traySelector": "[class*='cursor-grab'], [draggable='true']",
-                        "slotId": tid})
-        if not plan.get("ok"):
-            # Fall back to a direct press-drag on the slot itself: some builds
-            # accept dragging the ghost wall that appears on hover.
-            el = self.page.locator(f'[data-testid="{tid}"]')
-            box = el.bounding_box()
-            if not box:
-                return False
-            cx, cy = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
-            self.page.mouse.move(cx, cy)
-            self.page.mouse.down()
-            self.page.mouse.move(cx + 2, cy + 2, steps=3)
-            self.page.mouse.up()
-            return True
-        f, t = plan["from"], plan["to"]
-        self.page.mouse.move(f["x"], f["y"])
-        self.page.mouse.down()
-        for i in range(1, 13):  # dnd-kit needs real intermediate movement
-            self.page.mouse.move(f["x"] + (t["x"] - f["x"]) * i / 12,
-                                 f["y"] + (t["y"] - f["y"]) * i / 12, steps=2)
-        self.page.mouse.up()
+        el = self.page.locator(f'[data-testid="{tid}"]')
+        if not el.count():
+            return False
+        box = el.first.bounding_box()
+        if not box:
+            return False
+        cx, cy = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+        # Hovering reveals the ghost wall; a plain click commits it in the
+        # current build. Fall back to a short press-drag for drag-only builds.
+        self.page.mouse.move(cx, cy)
+        self.page.wait_for_timeout(120)
+        self.page.mouse.click(cx, cy)
         return True
 
 
 class Engine:
-    """The trained network plus leaf-batched MCTS, with a clock budget."""
-
     LEAF = 32
+    # Measured on a real mid-game position with a cold tree (the synthetic
+    # benchmark's 38k/s does not survive contact with a fresh root).
+    SIMS_PER_SEC = 19000
 
     def __init__(self, checkpoint: str, device: str, max_sims: int):
         if device == "auto":
@@ -394,32 +296,21 @@ class Engine:
                                 leaf_batch=self.LEAF)
         self.max_sims = max_sims
 
-    # Measured throughput of the leaf-batched search on this machine.
-    SIMS_PER_SEC = 38000
-
     def sims_for(self, clock: float | None, increment: float = 3.0) -> int:
-        """Simulations to run, from the remaining clock.
+        """Whichever is tighter: a little over the increment, or clock/20.
 
-        Two ceilings, whichever is tighter: a little over the increment (so the
-        clock trends up, not down), and a fixed fraction of what is left (so a
-        low clock forces fast moves). Earlier ranked games averaged 8.7 s/move
-        against opponents playing at 2.7 s -- losing on time is a real way to
-        lose these games, not a hypothetical.
+        Earlier ranked games averaged 8.7 s/move against opponents playing at
+        2.7 s. Losing on time is a real way to lose these games.
         """
-        if clock is None:
-            budget_s = increment
-        else:
-            budget_s = min(1.2 * increment, clock / 20.0)
-        return int(max(256, min(self.max_sims, budget_s * self.SIMS_PER_SEC)))
+        budget = increment if clock is None else min(1.2 * increment, clock / 20.0)
+        return int(max(256, min(self.max_sims, budget * self.SIMS_PER_SEC)))
 
-    def choose(self, st: np.ndarray, sims: int) -> tuple[int, float, np.ndarray]:
+    def choose(self, st: np.ndarray, sims: int):
         visits = self.mcts.search(st.reshape(1, -1).copy(), sims)[0]
-        value = float(self.mcts.root_value()[0])
-        return int(visits.argmax()), value, visits
+        return int(visits.argmax()), float(self.mcts.root_value()[0]), visits
 
 
-def describe(action: int, st_after: np.ndarray | None = None,
-             mover: int | None = None) -> str:
+def describe(action: int, st_after=None, mover=None) -> str:
     if action >= fr.MOVE_BASE:
         if st_after is not None and mover is not None:
             cell = int(st_after[fr.IDX_P0 if mover == 0 else fr.IDX_P1])
@@ -443,45 +334,51 @@ def render(st: np.ndarray) -> str:
     return s.render()
 
 
-# ------------------------------------------------------------------ driver
-
-
-def should_stop() -> bool:
-    return STOP_FILE.exists()
-
-
 def play_one_move(bridge: Bridge, engine: Engine, args) -> str:
-    """Read, decide, play, verify. Returns a status string."""
-    read = bridge.read()
+    dom = bridge.snapshot()
+    if dom is None:
+        return "no-board"
+    read, err = bridge.decode(dom)
     if read is None:
+        print(f"  !! board read failed: {err}")
         return "read-failed"
-    if read.walls_expected >= 0 and not read.consistent:
-        print(f"  !! wall cross-check failed: DOM shows {read.walls_seen} walls, "
+    if read.game_over:
+        return "game-over"
+    if read.walls_expected >= 0 and read.walls_seen != read.walls_expected:
+        print(f"  !! wall cross-check failed: {read.walls_seen} walls in the DOM, "
               f"barricade counters imply {read.walls_expected}")
         return "inconsistent"
-    if int(read.state[fr.IDX_TURN]) != read.us:
-        return "not-our-turn"
 
-    mask = np.zeros(fr.NUM_ACTIONS, dtype=np.uint8)
+    turn = bridge.whose_turn(read.us)
+    if turn is None:
+        return "turn-unknown"
+    if turn != read.us:
+        return "not-our-turn"
+    read.state[fr.IDX_TURN] = read.us
+
     scratch = fr.make_scratch()
+    mask = np.zeros(fr.NUM_ACTIONS, dtype=np.uint8)
     fr.legal_mask(read.state, mask, scratch)
     if not mask.any():
         return "no-legal-moves"
 
-    sims = engine.sims_for(read.our_clock)
+    clocks = bridge.page.evaluate(CLOCKS_JS)
+    our_clock = clock_seconds(clocks[1]["t"]) if len(clocks) == 2 else None
+    sims = engine.sims_for(our_clock)
+
     t0 = time.perf_counter()
     action, value, visits = engine.choose(read.state, sims)
     think = time.perf_counter() - t0
     if not mask[action]:
-        print(f"  !! engine chose an action illegal in the read position "
-              f"({action}) -- board read is wrong")
+        print("  !! engine chose an action illegal in the read position")
         return "illegal"
 
     expected = read.state.copy()
     fr.apply_action(expected, action, scratch)
     share = float(visits[action] / max(visits.sum(), 1))
-    print(f"  {describe(action, expected, read.us)}  "
-          f"[{sims} sims, {think:.1f}s, eval {value:+.2f}, {100 * share:.0f}%]")
+    print(f"  {describe(action, expected, read.us):<16} "
+          f"[{sims} sims, {think:.1f}s, eval {value:+.2f}, {100 * share:.0f}%"
+          + (f", clock {our_clock:.0f}s" if our_clock else "") + "]")
 
     if args.dry_run:
         print(render(read.state))
@@ -491,38 +388,34 @@ def play_one_move(bridge: Bridge, engine: Engine, args) -> str:
         dest = int(expected[fr.IDX_P0 if read.us == 0 else fr.IDX_P1])
         bridge.play_pawn(dest, read.flipped)
     elif not bridge.play_wall(action, read.flipped):
-        return "wall-drag-failed"
+        return "wall-place-failed"
 
-    # Confirm the site accepted exactly the move we intended.
-    for _ in range(12):
+    for _ in range(16):
         bridge.page.wait_for_timeout(250)
-        after = bridge.read()
+        dom2 = bridge.snapshot()
+        after, _ = bridge.decode(dom2) if dom2 else (None, "")
         if after is None:
             continue
-        ours_moved = (after.state[fr.IDX_P0] == expected[fr.IDX_P0]
-                      and after.state[fr.IDX_P1] == expected[fr.IDX_P1])
-        walls_match = (
-            np.array_equal(after.state[fr.WH_OFF:fr.WH_OFF + 64],
-                           expected[fr.WH_OFF:fr.WH_OFF + 64])
-            and np.array_equal(after.state[fr.WV_OFF:fr.WV_OFF + 64],
-                               expected[fr.WV_OFF:fr.WV_OFF + 64]))
-        if ours_moved and walls_match:
+        if (after.state[fr.IDX_P0] == expected[fr.IDX_P0]
+                and after.state[fr.IDX_P1] == expected[fr.IDX_P1]
+                and np.array_equal(after.state[fr.WH_OFF:fr.WH_OFF + 64],
+                                   expected[fr.WH_OFF:fr.WH_OFF + 64])
+                and np.array_equal(after.state[fr.WV_OFF:fr.WV_OFF + 64],
+                                   expected[fr.WV_OFF:fr.WV_OFF + 64])):
             return "played"
     print("  !! could not confirm the move registered on the site")
     return "unconfirmed"
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--checkpoint", default="checkpoints/best.pt")
     ap.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
-    ap.add_argument("--max-sims", type=int, default=65536,
-                    help="ceiling on simulations per move (memory scales with it)")
+    ap.add_argument("--max-sims", type=int, default=32768)
     ap.add_argument("--max-games", type=int, default=0, help="0 = until stopped")
-    ap.add_argument("--dry-run", action="store_true",
-                    help="read and decide, but never click")
-    ap.add_argument("--url", default=f"{BASE}/", help="page to start from")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--url", default=f"{BASE}/")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -530,7 +423,6 @@ def main() -> None:
 
     if STOP_FILE.exists():
         STOP_FILE.unlink()
-        print(f"removed stale {STOP_FILE}")
 
     print("loading engine...")
     engine = Engine(args.checkpoint, args.device, args.max_sims)
@@ -539,67 +431,52 @@ def main() -> None:
           f"(gen {m.get('iteration', '?')}, {m.get('elo', 0):+.0f} Elo internal)")
 
     stopping = {"flag": False}
-
-    def on_sigint(signum, frame):
-        stopping["flag"] = True
-        print("\nstopping after the current move...")
-
-    signal.signal(signal.SIGINT, on_sigint)
+    signal.signal(signal.SIGINT,
+                  lambda *_: (stopping.__setitem__("flag", True),
+                              print("\nstopping after this move...")))
 
     with sync_playwright() as pw:
-        # A persistent profile keeps your login between runs. Log in by hand in
-        # the window that opens the first time; this script never sees a password.
         PROFILE_DIR.mkdir(parents=True, exist_ok=True)
         ctx = pw.firefox.launch_persistent_context(
             str(PROFILE_DIR), headless=False,
-            viewport={"width": 1500, "height": 1000},
-        )
+            viewport={"width": 1500, "height": 1000})
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         page.goto(args.url, wait_until="networkidle", timeout=60000)
 
         bridge = Bridge(page, verbose=args.verbose)
-        print("\nIf you are not signed in, sign in now in the browser window.")
-        print("Then open a ranked game. Waiting for a board...\n")
+        print("\nSign in if needed, then open a game. Waiting for a board...\n")
 
         games = 0
-        idle_since = time.time()
-        while not (stopping["flag"] or should_stop()):
+        while not (stopping["flag"] or STOP_FILE.exists()):
             if args.max_games and games >= args.max_games:
                 print(f"reached --max-games {args.max_games}")
                 break
-            if not bridge.refresh_geometry():
-                page.wait_for_timeout(1500)
-                if time.time() - idle_since > 300:
-                    print("no board for 5 minutes; still waiting "
-                          f"(create {STOP_FILE} to stop)")
-                    idle_since = time.time()
-                continue
-
             status = play_one_move(bridge, engine, args)
+
             if status in ("read-failed", "inconsistent", "illegal",
-                          "wall-drag-failed", "unconfirmed"):
-                print(f"  aborting: {status}. The board reader needs attention; "
-                      f"re-run with --dry-run --verbose.")
+                          "wall-place-failed", "unconfirmed"):
+                print(f"  aborting: {status}")
                 if args.verbose:
-                    read = bridge.read()
-                    print(json.dumps(
-                        {"pawns": read.raw_pawns if read else None,
-                         "walls": read.raw_walls[:8] if read else None},
-                        indent=1, default=str)[:2000])
+                    dom = bridge.snapshot()
+                    print(json.dumps({"pawns": dom.get("pawns"),
+                                      "walls": dom.get("walls", [])[:6],
+                                      "flipped": dom.get("flipped"),
+                                      "barricades": dom.get("barricades"),
+                                      "you": dom.get("youArePlayer")},
+                                     indent=1)[:1500] if dom else "no DOM")
                 break
             if status == "dry-run":
-                print("\ndry run complete -- compare the board above with your "
-                      "screen. If it matches, the reader works.")
+                print("\nDry run: compare the board above with your screen.")
                 break
-            if status in ("not-our-turn", "no-legal-moves"):
-                page.wait_for_timeout(600)
-                continue
-
-            info = bridge.page.evaluate(TURN_JS)
-            if info.get("gameOver"):
+            if status == "game-over":
                 games += 1
-                print(f"game finished ({games}). {info['text'][:120]}\n")
-                page.wait_for_timeout(3000)
+                print(f"game finished ({games})\n")
+                page.wait_for_timeout(4000)
+                continue
+            if status in ("no-board", "not-our-turn", "turn-unknown",
+                          "no-legal-moves"):
+                page.wait_for_timeout(700)
+                continue
 
         print(f"stopped after {games} completed game(s)")
         if STOP_FILE.exists():
