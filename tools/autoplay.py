@@ -107,9 +107,12 @@ BOARD_JS = r"""() => {
     const colour = cls.includes('bg-red') ? 'red'
                  : cls.includes('bg-blue') ? 'blue' : null;
     if (!colour) return;
+    // Keep the fractional grid position: the site animates pawn movement, and
+    // a pawn caught between squares must be rejected, not rounded to a
+    // plausible-looking wrong cell.
     pawns.push({colour,
-                col: Math.round((r.x + r.width / 2 - ox - cell / 2) / pitch),
-                vrow: Math.round((r.y + r.height / 2 - oy - cell / 2) / pitch)});
+                colF: (r.x + r.width / 2 - ox - cell / 2) / pitch,
+                vrowF: (r.y + r.height / 2 - oy - cell / 2) / pitch});
   });
 
   // Distinguishing a placed wall from the hover preview cannot be done by
@@ -338,8 +341,12 @@ class Bridge:
 
         by_colour: dict[str, int] = {}
         for p in dom["pawns"]:
-            # JS Math.round can hand back -0.0; normalise to plain ints.
-            vrow, col = int(round(p["vrow"])), int(round(p["col"]))
+            col_f, vrow_f = float(p["colF"]), float(p["vrowF"])
+            col, vrow = int(round(col_f)), int(round(vrow_f))
+            # A pawn mid-slide sits between squares. Rounding it produces a
+            # legal-looking position for the wrong board, so wait instead.
+            if abs(col_f - col) > 0.2 or abs(vrow_f - vrow) > 0.2:
+                return None, "wait: a pawn is between squares (animating)"
             row = 8 - vrow if flipped else vrow
             if not (0 <= row < 9 and 0 <= col < 9):
                 return None, f"pawn off board: {p}"
@@ -628,22 +635,27 @@ def play_one_move(bridge: Bridge, engine: Engine, args) -> str:
         return "read-failed"
     banner = read.raw.get("gameOverLabel")
     won = fr.winner(read.state)
-    if read.game_over or won >= 0:
-        why = f"banner {banner!r}" if read.game_over else "a pawn is on its goal row"
-        # The site rings destinations only for the side to move, so highlights
-        # are proof the game is still running -- whatever else the page shows,
-        # and whatever we decoded. Never abandon a live game.
+    if won >= 0:
+        # A pawn on its goal row is decisive. Orientation is only accepted from
+        # a complete, monotonic set of rank labels, so this cannot come from a
+        # mirrored read; stale highlights sometimes linger after the win and
+        # must not veto it.
+        if args.verbose:
+            print(f"  game-over: {'we' if won == read.us else 'opponent'} "
+                  f"reached the goal row")
+        return "game-over"
+    if read.game_over:
+        # A banner with no winner means resignation, timeout, or a stray match.
+        # Here the highlights are worth trusting: the site rings destinations
+        # only for the side to move, so their presence means the game is live.
         if read.our_turn:
-            print(f"  ignoring a game-over signal ({why}): it is our turn with "
-                  f"{len(read.highlights)} legal moves, so the game is live")
-            print(f"    decoded P0={int(read.state[fr.IDX_P0])} "
-                  f"P1={int(read.state[fr.IDX_P1])} flipped={read.flipped} "
-                  f"us={read.us} walls={read.walls_seen}")
+            print(f"  ignoring a game-over banner ({banner!r}): it is our turn "
+                  f"with {len(read.highlights)} legal moves, so the game is live")
             if args.verbose:
                 print(render(read.state))
         else:
             if args.verbose:
-                print(f"  game-over: {why}")
+                print(f"  game-over: banner {banner!r}")
             return "game-over"
     if read.walls_expected >= 0 and read.walls_seen != read.walls_expected:
         # A wall placed moments ago may still be fading in (the slot child
@@ -705,11 +717,33 @@ def play_one_move(bridge: Bridge, engine: Engine, args) -> str:
         return "no-legal-moves"
 
     # Independent confirmation that we decoded the right position: the site's
-    # own legal destinations must match the engine's.
+    # own legal destinations must match the engine's. A disagreement is usually
+    # transient (something still settling on the page), so re-read before
+    # treating it as a real misread.
     if set(read.highlights) != engine_dests:
-        print(f"  !! legality mismatch: site offers {sorted(read.highlights)}, "
-              f"engine computes {sorted(engine_dests)}")
-        return "legality-mismatch"
+        settled = None
+        for _ in range(5):
+            bridge.page.wait_for_timeout(300)
+            dom_r = bridge.snapshot()
+            cand, _err = bridge.decode(dom_r) if dom_r else (None, "")
+            if cand is None or not cand.our_turn:
+                continue
+            cand.state[fr.IDX_TURN] = cand.us
+            fr.legal_mask_dests(cand.state, mask, scratch, dests)
+            cand_dests = {int(dests[i]) for i in range(12)
+                          if mask[fr.MOVE_BASE + i]}
+            if set(cand.highlights) == cand_dests:
+                settled, engine_dests = cand, cand_dests
+                break
+        if settled is None:
+            print(f"  !! legality mismatch: site offers {sorted(read.highlights)}, "
+                  f"engine computes {sorted(engine_dests)}")
+            print(f"    decoded P0={int(read.state[fr.IDX_P0])} "
+                  f"P1={int(read.state[fr.IDX_P1])} flipped={read.flipped} "
+                  f"us={read.us} walls={read.walls_seen}/{read.walls_expected}")
+            print(render(read.state))
+            return "legality-mismatch"
+        read = settled
 
     clocks = bridge.page.evaluate(CLOCKS_JS)
     our_clock = clock_seconds(clocks[1]["t"]) if len(clocks) == 2 else None
