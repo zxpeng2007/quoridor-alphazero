@@ -79,6 +79,10 @@ BOARD_JS = r"""() => {
   const pitch = r11.x - r00.x, gap = r00.height, cell = pitch - gap;
   const ox = r00.x, oy = r00.y - cell;
 
+  // Orientation from the rank labels. Demand a full, strictly monotonic run:
+  // reading a partially rendered board could otherwise yield two labels in an
+  // arbitrary order, and a wrong flip maps our own pawn onto its goal row,
+  // making a fresh game look already won.
   const labels = [];
   board.querySelectorAll('div').forEach(el => {
     const t = el.textContent.trim();
@@ -86,8 +90,14 @@ BOARD_JS = r"""() => {
       labels.push({r: +t, y: el.getBoundingClientRect().y});
   });
   labels.sort((a, b) => a.y - b.y);
-  const flipped = labels.length >= 2
-    ? labels[0].r > labels[labels.length - 1].r : null;
+  let flipped = null;
+  if (labels.length === 9) {
+    const ranks = labels.map(l => l.r);
+    const desc = ranks.every((v, i) => i === 0 || ranks[i - 1] === v + 1);
+    const asc = ranks.every((v, i) => i === 0 || ranks[i - 1] === v - 1);
+    if (desc) flipped = true;         // rank 9 at the top: the default view
+    else if (asc) flipped = false;    // rotated for the second seat
+  }
 
   const pawns = [];
   board.querySelectorAll('div.rounded-full').forEach(el => {
@@ -305,7 +315,9 @@ class Bridge:
         if dom is None:
             return None, "no board on the page"
         if dom["flipped"] is None:
-            return None, "could not read board orientation from rank labels"
+            # Transient while the board is still rendering; wait rather than
+            # guess, since a wrong orientation mirrors the whole position.
+            return None, "wait: board orientation not readable yet"
         flipped = bool(dom["flipped"])
 
         st = fr.initial_state()
@@ -610,26 +622,29 @@ def play_one_move(bridge: Bridge, engine: Engine, args) -> str:
         return "no-board"
     read, err = bridge.decode(dom)
     if read is None:
+        if err.startswith("wait:"):
+            return "no-board"          # still rendering; poll again
         print(f"  !! board read failed: {err}")
         return "read-failed"
-    if read.game_over:
-        # Never abandon a game that is plainly still running: the site only
-        # rings destinations for the side to move, so highlights mean live.
-        if read.our_turn and fr.winner(read.state) < 0:
-            print(f"  ignoring a game-over signal "
-                  f"({read.raw.get('gameOverLabel')!r}) -- it is our turn with "
+    banner = read.raw.get("gameOverLabel")
+    won = fr.winner(read.state)
+    if read.game_over or won >= 0:
+        why = f"banner {banner!r}" if read.game_over else "a pawn is on its goal row"
+        # The site rings destinations only for the side to move, so highlights
+        # are proof the game is still running -- whatever else the page shows,
+        # and whatever we decoded. Never abandon a live game.
+        if read.our_turn:
+            print(f"  ignoring a game-over signal ({why}): it is our turn with "
                   f"{len(read.highlights)} legal moves, so the game is live")
+            print(f"    decoded P0={int(read.state[fr.IDX_P0])} "
+                  f"P1={int(read.state[fr.IDX_P1])} flipped={read.flipped} "
+                  f"us={read.us} walls={read.walls_seen}")
+            if args.verbose:
+                print(render(read.state))
         else:
             if args.verbose:
-                print(f"  game-over signalled by: "
-                      f"{read.raw.get('gameOverLabel')!r}")
+                print(f"  game-over: {why}")
             return "game-over"
-    # A finished board can linger on screen with a pawn already home. Searching
-    # from a decided position yields no move at all, so treat it as over.
-    if fr.winner(read.state) >= 0:
-        if args.verbose:
-            print("  game-over: a pawn is already on its goal row")
-        return "game-over"
     if read.walls_expected >= 0 and read.walls_seen != read.walls_expected:
         # A wall placed moments ago may still be fading in (the slot child
         # carries a 150ms transition), so the DOM can legitimately lag the

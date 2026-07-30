@@ -40,6 +40,8 @@ BOARD_JS = r"""() => {
   const ox = r00.x, oy = r00.y - cell;
 
   // Orientation from the rank labels: never assume which way the board is drawn.
+  // Must stay identical to autoplay.py: demand a full monotonic run of rank
+  // labels, so a partially rendered board is refused rather than mirrored.
   const labels = [];
   board.querySelectorAll('div').forEach(el => {
     const t = el.textContent.trim();
@@ -47,8 +49,14 @@ BOARD_JS = r"""() => {
       labels.push({r: +t, y: el.getBoundingClientRect().y});
   });
   labels.sort((a, b) => a.y - b.y);
-  const flipped = labels.length >= 2
-    ? labels[0].r > labels[labels.length - 1].r : null;
+  let flipped = null;
+  if (labels.length === 9) {
+    const ranks = labels.map(l => l.r);
+    const desc = ranks.every((v, i) => i === 0 || ranks[i - 1] === v + 1);
+    const asc = ranks.every((v, i) => i === 0 || ranks[i - 1] === v - 1);
+    if (desc) flipped = true;
+    else if (asc) flipped = false;
+  }
 
   // Pawns are colour-coded: red is the first seat, blue the second. Colour is
   // authoritative -- position is not, because the pawns cross during a game.
@@ -164,9 +172,11 @@ def main() -> None:
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=args.headless)
         page = browser.new_page(viewport={"width": 1500, "height": 1000})
+        # 'networkidle' never settles on this site (live sockets).
         page.goto(f"https://barricade.gg/analysis?game={args.game}",
-                  wait_until="networkidle", timeout=45000)
-        page.wait_for_timeout(1200)
+                  wait_until="domcontentloaded", timeout=45000)
+        page.wait_for_selector('[data-testid="slot-horizontal-0-0"]', timeout=30000)
+        page.wait_for_timeout(1500)
 
         # The analysis page opens at the final position; rewind to the start.
         try:
