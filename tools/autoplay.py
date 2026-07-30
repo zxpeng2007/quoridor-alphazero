@@ -126,13 +126,29 @@ BOARD_JS = r"""() => {
     walls.push({tid: el.dataset.testid, bg: ks.backgroundColor});
   });
 
+  // The site rings every legal pawn destination while it is your move, and
+  // shows none otherwise. That is both the turn signal and an independent
+  // check on the decoded position: if the site's legal destinations disagree
+  // with the engine's, the board has been misread.
+  const highlights = [];
+  for (const el of board.children) {
+    if (el.dataset.testid) continue;
+    const cls = (el.className || '').toString();
+    if (!cls.includes('ring-2') && !cls.includes('animate-pulse')) continue;
+    const r = el.getBoundingClientRect();
+    if (r.width < 30) continue;
+    highlights.push({col: Math.round((r.x + r.width / 2 - ox - cell / 2) / pitch),
+                     vrow: Math.round((r.y + r.height / 2 - oy - cell / 2) / pitch)});
+  }
+
   const text = document.body.innerText;
   const bars = (text.match(/Barricades:\s*(\d+)\s*\/\s*10/g) || [])
     .map(s => +s.match(/(\d+)/)[1]);
   return {geo: {bx: bb.x, by: bb.y, pitch, cell, gap, ox, oy},
-          flipped, pawns, walls, barricades: bars,
+          flipped, pawns, walls, highlights, barricades: bars,
           youArePlayer: (text.match(/You are Player (\d)/) || [])[1] || null,
-          gameOver: /won by|You won|You lost|resigned|Draw|Rematch/i.test(text),
+          gameOver: /won by|you won|you lost|has resigned|rematch|play again/i
+                      .test(text),
           text: text.slice(0, 300)};
 }"""
 
@@ -164,7 +180,13 @@ class BoardRead:
     walls_seen: int
     walls_expected: int
     game_over: bool
+    highlights: set[int]     # legal pawn destinations per the site
     raw: dict = field(repr=False)
+
+    @property
+    def our_turn(self) -> bool:
+        # The site only rings destinations on the side to move.
+        return bool(self.highlights)
 
 
 class Bridge:
@@ -239,10 +261,18 @@ class Bridge:
         if us is None:
             return None, "could not determine which seat we are playing"
 
+        highlights: set[int] = set()
+        for h in dom.get("highlights") or []:
+            vrow, col = int(round(h["vrow"])), int(round(h["col"]))
+            row = 8 - vrow if flipped else vrow
+            if 0 <= row < 9 and 0 <= col < 9:
+                highlights.add(row * 9 + col)
+
         return BoardRead(state=st, flipped=flipped, us=us,
                          walls_seen=len(dom["walls"]),
                          walls_expected=walls_expected,
-                         game_over=bool(dom.get("gameOver")), raw=dom), ""
+                         game_over=bool(dom.get("gameOver")),
+                         highlights=highlights, raw=dom), ""
 
     def whose_turn(self, us: int, settle: float = 1.1) -> int | None:
         """Which engine player is to move, from which clock is ticking.
@@ -371,18 +401,50 @@ def play_one_move(bridge: Bridge, engine: Engine, args) -> str:
               f"barricade counters imply {read.walls_expected}")
         return "inconsistent"
 
-    turn = bridge.whose_turn(read.us)
-    if turn is None:
-        return "turn-unknown"
-    if turn != read.us:
-        return "not-our-turn"
+    # A dry run exists to validate the *reader*, so it reports the position
+    # unconditionally rather than waiting for our turn -- otherwise a turn
+    # detection problem hides the board decode entirely.
     read.state[fr.IDX_TURN] = read.us
-
     scratch = fr.make_scratch()
     mask = np.zeros(fr.NUM_ACTIONS, dtype=np.uint8)
-    fr.legal_mask(read.state, mask, scratch)
+    dests = np.zeros(12, dtype=np.int32)
+    fr.legal_mask_dests(read.state, mask, scratch, dests)
+    engine_dests = {int(dests[i]) for i in range(12)
+                    if mask[fr.MOVE_BASE + i]}
+
+    if args.dry_run:
+        print(f"  seat: engine player {read.us} "
+              f"({'red' if read.us == 0 else 'blue'}), "
+              f"board {'flipped' if read.flipped else 'normal'}")
+        print(f"  walls: {read.walls_seen} on board, counters imply "
+              f"{read.walls_expected}")
+        print(f"  turn: {'ours' if read.our_turn else 'opponent (no highlights)'}"
+              f"  [{len(read.highlights)} highlighted destinations]")
+        print(render(read.state))
+        if read.our_turn:
+            agree = read.highlights == engine_dests
+            print(f"  legality cross-check: site {sorted(read.highlights)} vs "
+                  f"engine {sorted(engine_dests)} -> "
+                  f"{'AGREE' if agree else 'MISMATCH (board misread)'}")
+            if agree and mask.any():
+                action, value, _ = engine.choose(read.state, 4096)
+                after = read.state.copy()
+                fr.apply_action(after, action, scratch)
+                print(f"  engine would play: "
+                      f"{describe(action, after, read.us)} (eval {value:+.2f})")
+        return "dry-run"
+
+    if not read.our_turn:
+        return "not-our-turn"
     if not mask.any():
         return "no-legal-moves"
+
+    # Independent confirmation that we decoded the right position: the site's
+    # own legal destinations must match the engine's.
+    if read.highlights != engine_dests:
+        print(f"  !! legality mismatch: site offers {sorted(read.highlights)}, "
+              f"engine computes {sorted(engine_dests)}")
+        return "legality-mismatch"
 
     clocks = bridge.page.evaluate(CLOCKS_JS)
     our_clock = clock_seconds(clocks[1]["t"]) if len(clocks) == 2 else None
@@ -401,10 +463,6 @@ def play_one_move(bridge: Bridge, engine: Engine, args) -> str:
     print(f"  {describe(action, expected, read.us):<16} "
           f"[{sims} sims, {think:.1f}s, eval {value:+.2f}, {100 * share:.0f}%"
           + (f", clock {our_clock:.0f}s" if our_clock else "") + "]")
-
-    if args.dry_run:
-        print(render(read.state))
-        return "dry-run"
 
     if action >= fr.MOVE_BASE:
         dest = int(expected[fr.IDX_P0 if read.us == 0 else fr.IDX_P1])
@@ -469,14 +527,31 @@ def main() -> None:
         print("\nSign in if needed, then open a game. Waiting for a board...\n")
 
         games = 0
+        last_note = 0.0
+        last_status = ""
         while not (stopping["flag"] or STOP_FILE.exists()):
             if args.max_games and games >= args.max_games:
                 print(f"reached --max-games {args.max_games}")
                 break
             status = play_one_move(bridge, engine, args)
 
+            # Never sit silent: say what we are waiting for, at most every 5s.
+            if status in ("no-board", "not-our-turn", "turn-unknown",
+                          "no-legal-moves"):
+                now = time.time()
+                if now - last_note > 5.0 or status != last_status:
+                    reason = {
+                        "no-board": "no board on the page (open a game)",
+                        "not-our-turn": "opponent to move (no highlighted cells)",
+                        "turn-unknown": "cannot tell whose turn it is",
+                        "no-legal-moves": "no legal moves in the read position",
+                    }[status]
+                    print(f"  waiting: {reason}")
+                    last_note, last_status = now, status
+
             if status in ("read-failed", "inconsistent", "illegal",
-                          "wall-place-failed", "unconfirmed"):
+                          "legality-mismatch", "wall-place-failed",
+                          "unconfirmed"):
                 print(f"  aborting: {status}")
                 if args.verbose:
                     dom = bridge.snapshot()
