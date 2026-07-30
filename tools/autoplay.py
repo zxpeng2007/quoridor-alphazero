@@ -132,8 +132,11 @@ BOARD_JS = r"""() => {
     if (!cls.includes('ring-2') && !cls.includes('animate-pulse')) continue;
     const r = el.getBoundingClientRect();
     if (r.width < 30) continue;
+    // Carry the real screen centre too: clicking the element the site itself
+    // rings is exact, where recomputing the square from board geometry is not.
     highlights.push({col: Math.round((r.x + r.width / 2 - ox - cell / 2) / pitch),
-                     vrow: Math.round((r.y + r.height / 2 - oy - cell / 2) / pitch)});
+                     vrow: Math.round((r.y + r.height / 2 - oy - cell / 2) / pitch),
+                     cx: r.x + r.width / 2, cy: r.y + r.height / 2});
   }
 
   const text = document.body.innerText;
@@ -188,7 +191,8 @@ class BoardRead:
     walls_seen: int
     walls_expected: int
     game_over: bool
-    highlights: set[int]     # legal pawn destinations per the site
+    # Legal pawn destinations per the site: engine cell -> screen centre.
+    highlights: dict[int, tuple[float, float]]
     raw: dict = field(repr=False)
 
     @property
@@ -269,12 +273,12 @@ class Bridge:
         if us is None:
             return None, "could not determine which seat we are playing"
 
-        highlights: set[int] = set()
+        highlights: dict[int, tuple[float, float]] = {}
         for h in dom.get("highlights") or []:
             vrow, col = int(round(h["vrow"])), int(round(h["col"]))
             row = 8 - vrow if flipped else vrow
             if 0 <= row < 9 and 0 <= col < 9:
-                highlights.add(row * 9 + col)
+                highlights[row * 9 + col] = (h["cx"], h["cy"])
 
         return BoardRead(state=st, flipped=flipped, us=us,
                          walls_seen=len(dom["walls"]),
@@ -314,9 +318,19 @@ class Bridge:
         return (g["ox"] + col * g["pitch"] + g["cell"] / 2,
                 g["oy"] + vrow * g["pitch"] + g["cell"] / 2)
 
-    def play_pawn(self, cell: int, flipped: bool) -> None:
-        x, y = self.cell_xy(cell, flipped)
-        self.page.mouse.click(x, y)
+    def play_pawn(self, cell: int, read: "BoardRead") -> bool:
+        """Click the destination square the site itself has ringed.
+
+        Using the highlight element's own centre removes any dependence on
+        recomputing the square from board geometry.
+        """
+        target = read.highlights.get(cell)
+        if target is None:
+            print(f"  !! destination cell {cell} is not among the site's "
+                  f"highlighted moves {sorted(read.highlights)}")
+            return False
+        self.page.mouse.click(target[0], target[1])
+        return True
 
     def play_wall(self, action: int, flipped: bool) -> bool:
         """Place a wall by dragging the matching tray piece onto the slot.
@@ -452,7 +466,7 @@ def play_one_move(bridge: Bridge, engine: Engine, args) -> str:
               f"  [{len(read.highlights)} highlighted destinations]")
         print(render(read.state))
         if read.our_turn:
-            agree = read.highlights == engine_dests
+            agree = set(read.highlights) == engine_dests
             print(f"  legality cross-check: site {sorted(read.highlights)} vs "
                   f"engine {sorted(engine_dests)} -> "
                   f"{'AGREE' if agree else 'MISMATCH (board misread)'}")
@@ -471,7 +485,7 @@ def play_one_move(bridge: Bridge, engine: Engine, args) -> str:
 
     # Independent confirmation that we decoded the right position: the site's
     # own legal destinations must match the engine's.
-    if read.highlights != engine_dests:
+    if set(read.highlights) != engine_dests:
         print(f"  !! legality mismatch: site offers {sorted(read.highlights)}, "
               f"engine computes {sorted(engine_dests)}")
         return "legality-mismatch"
@@ -494,11 +508,20 @@ def play_one_move(bridge: Bridge, engine: Engine, args) -> str:
           f"[{sims} sims, {think:.1f}s, eval {value:+.2f}, {100 * share:.0f}%"
           + (f", clock {our_clock:.0f}s" if our_clock else "") + "]")
 
+    our_idx = fr.IDX_P0 if read.us == 0 else fr.IDX_P1
     if action >= fr.MOVE_BASE:
-        dest = int(expected[fr.IDX_P0 if read.us == 0 else fr.IDX_P1])
-        bridge.play_pawn(dest, read.flipped)
+        if not bridge.play_pawn(int(expected[our_idx]), read):
+            return "pawn-click-failed"
     elif not bridge.play_wall(action, read.flipped):
         return "wall-place-failed"
+
+    # Confirm only that OUR move landed. The opponent usually replies within a
+    # second, so requiring the whole board to equal the position after our move
+    # alone would essentially never hold.
+    want_wall = None
+    if action < fr.MOVE_BASE:
+        orient, slot = divmod(action, fr.NUM_WALL_SLOTS)
+        want_wall = (fr.WH_OFF if orient == 0 else fr.WV_OFF) + slot
 
     for _ in range(16):
         bridge.page.wait_for_timeout(250)
@@ -506,12 +529,10 @@ def play_one_move(bridge: Bridge, engine: Engine, args) -> str:
         after, _ = bridge.decode(dom2) if dom2 else (None, "")
         if after is None:
             continue
-        if (after.state[fr.IDX_P0] == expected[fr.IDX_P0]
-                and after.state[fr.IDX_P1] == expected[fr.IDX_P1]
-                and np.array_equal(after.state[fr.WH_OFF:fr.WH_OFF + 64],
-                                   expected[fr.WH_OFF:fr.WH_OFF + 64])
-                and np.array_equal(after.state[fr.WV_OFF:fr.WV_OFF + 64],
-                                   expected[fr.WV_OFF:fr.WV_OFF + 64])):
+        if want_wall is None:
+            if after.state[our_idx] == expected[our_idx]:
+                return "played"
+        elif after.state[want_wall]:
             return "played"
     print("  !! could not confirm the move registered on the site")
     return "unconfirmed"
@@ -581,7 +602,7 @@ def main() -> None:
 
             if status in ("read-failed", "inconsistent", "illegal",
                           "legality-mismatch", "wall-place-failed",
-                          "unconfirmed"):
+                          "pawn-click-failed", "unconfirmed"):
                 print(f"  aborting: {status}")
                 if args.verbose:
                     dom = bridge.snapshot()
