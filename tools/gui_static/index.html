@@ -508,7 +508,9 @@ function render() {
   if (meta.iteration !== undefined) bits.push(`gen ${meta.iteration}`);
   if (meta.elo !== undefined) bits.push(`${meta.elo >= 0 ? "+" : ""}${Math.round(meta.elo)} Elo`);
   if (meta.device) bits.push(meta.device);
-  document.getElementById("engineInfo").textContent = bits.join(" · ");
+  const info = document.getElementById("engineInfo");
+  info.textContent = bits.join(" · ");
+  info.title = meta.elo_basis || "";
 
   // controls sync
   document.getElementById("levelSel").value = st.level;
