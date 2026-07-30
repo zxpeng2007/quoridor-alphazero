@@ -38,21 +38,26 @@ def main() -> None:
     lo, hi = min(losses), max(losses)
 
     print(f"{'iter':>5} {'games':>10} {'p-loss':>8} {'v-loss':>8} {'top1':>6} "
-          f"{'plies':>6} {'vs best':>8} {'':>3} {'policy loss':<18}")
-    print("-" * 88)
+          f"{'plies':>6} {'vs best':>8} {'Elo':>8} {'':>3} {'policy loss':<18}")
+    print("-" * 98)
     for h in rows:
         flag = "^" if h["promoted"] else " "
+        elo = h.get("elo")
+        elo_s = f"{elo:>+8.0f}" if elo is not None else f"{'-':>8}"
         print(
             f"{h['iteration']:>5} {h['games']:>10,} "
             f"{h['policy_loss']:>8.4f} {h['value_loss']:>8.4f} "
             f"{100 * h['policy_top1']:>5.1f}% {h['mean_plies']:>6.1f} "
-            f"{100 * h['score_vs_best']:>7.1f}% {flag:>3} "
+            f"{100 * h['score_vs_best']:>7.1f}% {elo_s} {flag:>3} "
             f"{bar(h['policy_loss'], lo, hi):<18}"
         )
 
     promoted = sum(1 for h in history if h["promoted"])
     total_hours = sum(h["seconds"] for h in history) / 3600
-    cum_elo = sum(h["elo_gain"] for h in history if h["promoted"])
+    measured = [h["elo"] for h in history if h.get("elo") is not None]
+    cum_elo = measured[-1] if measured else sum(
+        h["elo_gain"] for h in history if h["promoted"]
+    )
     print("-" * 88)
     print(f"iterations   : {len(history)}  ({promoted} promoted, "
           f"{100 * promoted / len(history):.0f}%)")

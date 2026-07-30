@@ -6,8 +6,15 @@ incumbent. Gating matters -- unconditionally accepting each new network lets a b
 training step poison all subsequent self-play data, and the run can spiral without
 any obvious symptom.
 
-Run state (network, buffer, Elo history) is checkpointed every iteration so a run
-can be stopped and resumed.
+Elo is re-measured every iteration against a *growing gauntlet* of past
+checkpoints rather than against the fixed heuristic baselines. Fixed baselines
+saturate almost immediately -- the very first promoted network already beats the
+strongest heuristic 64-0, after which that anchor reports a flat ceiling no matter
+how much the engine improves. The gauntlet adds a new reference whenever the
+engine outgrows the newest one, so the scale keeps extending.
+
+Run state (network, buffer, Elo history, gauntlet) is checkpointed every
+iteration so a run can be stopped and resumed.
 """
 
 from __future__ import annotations
@@ -28,21 +35,49 @@ from quoridor.replay import ReplayBuffer
 from quoridor.selfplay import SelfPlayConfig, SelfPlayEngine
 from quoridor.train import Trainer, TrainConfig
 
+# Add a new gauntlet reference once the engine is this far past the newest one.
+NEW_REFERENCE_MARGIN = 250.0
+# A match this lopsided pins down almost nothing; prefer a closer reference.
+SATURATED = 0.97
 
-def build_net(args) -> QuoridorNet:
-    return QuoridorNet(NetConfig(channels=args.channels, blocks=args.blocks))
+
+def anchored_elo(best_net, references, device, args, seed):
+    """Estimate the current network's Elo against known-rating references.
+
+    Returns ``(elo, per_reference_detail)``. References whose match saturates are
+    dropped when a non-saturated one exists, since a shutout only establishes a
+    lower bound and would drag the estimate toward the prior's clamp.
+    """
+    ev = NetEvaluator(best_net, device=device)
+    results = []
+    for i, ref in enumerate(references[-args.elo_refs:]):
+        ref_net, _ = load_checkpoint(ref["path"], device)
+        r = batched_match(
+            ev, NetEvaluator(ref_net, device=device),
+            games=args.elo_games, sims=args.eval_sims,
+            name_a="best", name_b=ref["name"],
+            c_puct=args.c_puct, fpu_reduction=args.fpu, seed=seed * 31 + i,
+        )
+        results.append((ref, r, ref["elo"] + score_to_elo(r.smoothed_score)))
+        del ref_net
+
+    usable = [x for x in results if x[1].score_a < SATURATED] or results
+    elo = float(np.mean([x[2] for x in usable]))
+    detail = "  ".join(
+        f"{ref['name']}@{ref['elo']:.0f}: {100 * r.score_a:.0f}%" for ref, r, _ in results
+    )
+    return elo, detail
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--init", default="checkpoints/bootstrap.pt",
-                    help="starting checkpoint (from tools/bootstrap.py)")
+    ap.add_argument("--init", default="checkpoints/bootstrap.pt")
     ap.add_argument("--out-dir", default="checkpoints")
     ap.add_argument("--iterations", type=int, default=100)
-    ap.add_argument("--games-per-iter", type=int, default=3000)
-    ap.add_argument("--steps-per-iter", type=int, default=800)
-    ap.add_argument("--sims", type=int, default=300)
-    ap.add_argument("--parallel", type=int, default=768)
+    ap.add_argument("--games-per-iter", type=int, default=4000)
+    ap.add_argument("--steps-per-iter", type=int, default=900)
+    ap.add_argument("--sims", type=int, default=256)
+    ap.add_argument("--parallel", type=int, default=1024)
     ap.add_argument("--batch-size", type=int, default=1024)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--buffer", type=int, default=2_000_000)
@@ -51,6 +86,8 @@ def main() -> None:
     ap.add_argument("--eval-games", type=int, default=200)
     ap.add_argument("--eval-sims", type=int, default=200)
     ap.add_argument("--promote-threshold", type=float, default=0.55)
+    ap.add_argument("--elo-games", type=int, default=48, help="games per gauntlet match")
+    ap.add_argument("--elo-refs", type=int, default=2, help="references per iteration")
     ap.add_argument("--c-puct", type=float, default=1.6)
     ap.add_argument("--fpu", type=float, default=0.2)
     ap.add_argument("--resume", action="store_true")
@@ -58,13 +95,14 @@ def main() -> None:
 
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
+    (out / "refs").mkdir(exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch.backends.cudnn.benchmark = True
     fr.warmup()
 
-    # ------------------------------------------------------------- load state
     best_path = out / "best.pt"
     history_path = out / "history.json"
+    refs_path = out / "references.json"
     history: list[dict] = []
     start_iter = 0
 
@@ -78,11 +116,24 @@ def main() -> None:
         best, _ = load_checkpoint(args.init, device)
         print(f"initialised from {args.init}")
     else:
-        best = build_net(args).to(device)
+        best = QuoridorNet(NetConfig(channels=args.channels, blocks=args.blocks)).to(device)
         print("initialised from scratch (no bootstrap checkpoint found)")
         print("  warning: an unbootstrapped policy makes MCTS nearly blind in a")
         print("  140-action space; tools/bootstrap.py first is strongly advised.")
 
+    # The gauntlet is anchored at the bootstrap network = 0 Elo, so every number
+    # reported is "Elo gained over the supervised starting point".
+    if refs_path.exists():
+        references = json.loads(refs_path.read_text())
+    else:
+        anchor = out / "refs" / "ref-bootstrap.pt"
+        if not anchor.exists():
+            src, _ = load_checkpoint(args.init, device)
+            save_checkpoint(anchor, src, meta={"reference": True})
+        references = [{"name": "bootstrap", "path": str(anchor), "elo": 0.0}]
+        refs_path.write_text(json.dumps(references, indent=2))
+    print(f"gauntlet: {len(references)} reference(s), newest at "
+          f"{references[-1]['elo']:+.0f} Elo")
     print(f"net: {args.blocks}x{args.channels}, {best.num_params() / 1e6:.2f}M params, {device}\n")
 
     buffer = ReplayBuffer(capacity=args.buffer)
@@ -94,11 +145,8 @@ def main() -> None:
     sp_cfg = SelfPlayConfig(
         n_parallel=args.parallel, sims=args.sims, c_puct=args.c_puct, seed=start_iter
     )
-    # The search tree arrays are hundreds of MB; build the engine once and just
-    # point it at the current network each iteration.
     engine = SelfPlayEngine(NetEvaluator(best, device=device), sp_cfg)
 
-    # ------------------------------------------------------------------ loop
     for it in range(start_iter, args.iterations):
         t_iter = time.perf_counter()
         print(f"=== iteration {it} " + "=" * 46)
@@ -124,40 +172,44 @@ def main() -> None:
         stats = trainer.train_on_buffer(buffer, args.steps_per_iter)
         print(f"  train ({time.perf_counter() - t0:.0f}s): {stats}")
 
-        # 3. gate promotion on a head-to-head match
+        # 3. gate promotion on a head-to-head match against the incumbent
         t0 = time.perf_counter()
         result = batched_match(
             NetEvaluator(candidate, device=device),
             NetEvaluator(best, device=device),
-            games=args.eval_games,
-            sims=args.eval_sims,
-            name_a=f"cand-{it}",
-            name_b="best",
-            c_puct=args.c_puct,
-            fpu_reduction=args.fpu,
-            seed=it,
+            games=args.eval_games, sims=args.eval_sims,
+            name_a=f"cand-{it}", name_b="best",
+            c_puct=args.c_puct, fpu_reduction=args.fpu, seed=it,
         )
         promoted = result.score_a >= args.promote_threshold
         print(f"  arena ({time.perf_counter() - t0:.0f}s): {result}")
         print(f"  -> {'PROMOTED' if promoted else 'rejected'} "
               f"(needs {100 * args.promote_threshold:.0f}%)")
-
         if promoted:
             best = candidate
 
-        # 4. persist
-        save_checkpoint(
-            best_path, best,
-            meta={
-                "iteration": it,
-                "promoted": promoted,
-                "positions": buffer.total_added,
-                "policy_loss": stats.policy_loss,
-                "value_loss": stats.value_loss,
-            },
-        )
+        # 4. re-measure Elo against the gauntlet, every iteration
+        t0 = time.perf_counter()
+        elo, detail = anchored_elo(best, references, device, args, it)
+        print(f"  elo ({time.perf_counter() - t0:.0f}s): {elo:+.0f} "
+              f"over bootstrap   [{detail}]")
+
+        if elo - references[-1]["elo"] > NEW_REFERENCE_MARGIN:
+            ref_file = out / "refs" / f"ref-{it:03d}.pt"
+            save_checkpoint(ref_file, best, meta={"reference": True, "elo": elo})
+            references.append({"name": f"gen-{it:03d}", "path": str(ref_file), "elo": elo})
+            refs_path.write_text(json.dumps(references, indent=2))
+            print(f"  + new gauntlet reference at {elo:+.0f} Elo "
+                  f"({len(references)} total)")
+
+        # 5. persist
+        save_checkpoint(best_path, best, meta={
+            "iteration": it, "promoted": promoted,
+            "positions": buffer.total_added, "elo": elo,
+        })
         if promoted:
-            save_checkpoint(out / f"gen-{it:03d}.pt", best, meta={"iteration": it})
+            save_checkpoint(out / f"gen-{it:03d}.pt", best,
+                            meta={"iteration": it, "elo": elo})
 
         history.append({
             "iteration": it,
@@ -165,6 +217,7 @@ def main() -> None:
             "promoted": bool(promoted),
             "score_vs_best": result.score_a,
             "elo_gain": score_to_elo(result.smoothed_score),
+            "elo": elo,
             "policy_loss": stats.policy_loss,
             "value_loss": stats.value_loss,
             "policy_top1": stats.policy_acc,
@@ -177,9 +230,8 @@ def main() -> None:
         if it % 5 == 0:
             buffer.save(str(buf_path))
 
-        cum = sum(h["elo_gain"] for h in history if h["promoted"])
         print(f"  iteration took {time.perf_counter() - t_iter:.0f}s | "
-              f"cumulative Elo gain ~{cum:+.0f}\n")
+              f"Elo {elo:+.0f}\n")
 
 
 if __name__ == "__main__":

@@ -43,6 +43,28 @@ python tools/play.py checkpoints/best.pt play --first --sims 800
 python tools/play.py checkpoints/best.pt analyse --moves "S,N,S,N"
 ```
 
+## Training GUI
+
+A local graphical trainer for practising against the engine:
+
+```bash
+python tools/gui.py
+```
+
+Opens `http://127.0.0.1:8630/` in your browser (standard library server, binds
+localhost only). Features:
+
+- click-to-move with legal-move dots; hover a groove to preview a wall
+- five strength levels, from sampled-and-shallow up to 2000 sims/move
+- **coach mode**: live eval bar, blunder/inaccuracy tags on your moves with the
+  engine's suggestion, and a hint button (deeper search, shown as a ghost)
+- undo, resign, board flip, engine-first games
+- *reload engine* button re-reads the checkpoint mid-session, so a training run
+  writing new promotions to `best.pt` can be picked up between games
+
+The session logic lives in `quoridor/webgui.py` and is covered by
+`tests/test_webgui.py`; `tools/gui.py` is a thin stdlib HTTP shell around it.
+
 ## Layout
 
 | Module | Purpose |

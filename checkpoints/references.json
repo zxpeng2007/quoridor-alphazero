@@ -1,0 +1,17 @@
+[
+  {
+    "name": "bootstrap",
+    "path": "checkpoints\\refs\\ref-bootstrap.pt",
+    "elo": 0.0
+  },
+  {
+    "name": "gen-002",
+    "path": "checkpoints\\refs\\ref-002.pt",
+    "elo": 552.0844966846421
+  },
+  {
+    "name": "gen-005",
+    "path": "checkpoints\\refs\\ref-005.pt",
+    "elo": 933.781500460372
+  }
+]
