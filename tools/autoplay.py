@@ -102,13 +102,27 @@ BOARD_JS = r"""() => {
                 vrow: Math.round((r.y + r.height / 2 - oy - cell / 2) / pitch)});
   });
 
+  // A placed wall is opaque and coloured. The hover ghost is translucent grey
+  // (gray-300 at low alpha), so it must be rejected on BOTH counts -- checking
+  // only `opacity: 0` lets a partially faded ghost through and invents a wall.
+  const isWallPaint = (ks) => {
+    if (ks.opacity !== '' && parseFloat(ks.opacity) < 0.9) return false;
+    const m = ks.backgroundColor.match(/rgba?\(([^)]+)\)/);
+    if (!m) return false;
+    const p = m[1].split(',').map(s => parseFloat(s));
+    const [r, g, b] = p;
+    const alpha = p.length > 3 ? p[3] : 1;
+    if (alpha < 0.9) return false;                       // translucent => ghost
+    const spread = Math.max(r, g, b) - Math.min(r, g, b);
+    if (spread < 20) return false;                       // grey => ghost
+    return true;
+  };
   const walls = [];
   document.querySelectorAll('[data-testid^="slot-"]').forEach(el => {
     const kid = el.firstElementChild;
     if (!kid) return;
     const ks = getComputedStyle(kid);
-    if (ks.opacity === '0') return;
-    if (ks.backgroundColor === 'rgba(0, 0, 0, 0)') return;
+    if (!isWallPaint(ks)) return;
     walls.push({tid: el.dataset.testid, bg: ks.backgroundColor});
   });
 
@@ -162,6 +176,12 @@ class Bridge:
     # ---------------------------------------------------------------- read
 
     def snapshot(self) -> dict | None:
+        # Park the pointer off the board first: resting it over a groove paints
+        # a hover ghost that is easy to mistake for a placed wall.
+        try:
+            self.page.mouse.move(4, 4)
+        except Exception:
+            pass
         dom = self.page.evaluate(BOARD_JS)
         if dom:
             self.geo = dom["geo"]
@@ -192,10 +212,12 @@ class Bridge:
 
         by_colour: dict[str, int] = {}
         for p in dom["pawns"]:
-            row = 8 - p["vrow"] if flipped else p["vrow"]
-            if not (0 <= row < 9 and 0 <= p["col"] < 9):
+            # JS Math.round can hand back -0.0; normalise to plain ints.
+            vrow, col = int(round(p["vrow"])), int(round(p["col"]))
+            row = 8 - vrow if flipped else vrow
+            if not (0 <= row < 9 and 0 <= col < 9):
                 return None, f"pawn off board: {p}"
-            by_colour[p["colour"]] = row * 9 + p["col"]
+            by_colour[p["colour"]] = row * 9 + col
         if set(by_colour) != {"red", "blue"}:
             return None, (f"expected one red and one blue pawn, "
                           f"found {dom['pawns']}")
