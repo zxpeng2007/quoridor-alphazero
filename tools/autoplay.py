@@ -140,6 +140,24 @@ BOARD_JS = r"""() => {
   }
 
   const text = document.body.innerText;
+
+  // Game over requires a *visible* result element, not a text match anywhere
+  // on the page. Matching page text caught a permanently-mounted, hidden
+  // "Play again anytime" promo and declared every fresh board finished.
+  let gameOverLabel = null;
+  document.querySelectorAll('div,button,span,h1,h2,h3,p').forEach(el => {
+    if (gameOverLabel !== null) return;
+    if (el.children.length > 1) return;
+    const s = (el.textContent || '').trim();
+    if (!s || s.length > 30) return;
+    const isResult =
+      /^(victory|defeat|you win|you won|you lose|you lost|draw)\b/i.test(s) ||
+      /^rematch$/i.test(s);
+    if (!isResult) return;
+    const r = el.getBoundingClientRect();
+    if (r.width > 0 && r.height > 0) gameOverLabel = s;
+  });
+
   // Each player's remaining barricades, taken from its own panel. The panel
   // carries a colour swatch (bg-red-500 / bg-blue-500) matching that player's
   // pawn, which identifies the owner outright. Ownership cannot be read from
@@ -159,8 +177,7 @@ BOARD_JS = r"""() => {
   return {geo: {bx: bb.x, by: bb.y, pitch, cell, gap, ox, oy},
           flipped, pawns, walls, highlights, barricades: bars,
           youArePlayer: (text.match(/You are Player (\d)/) || [])[1] || null,
-          gameOver: /won by|you won|you lost|has resigned|rematch|play again/i
-                      .test(text),
+          gameOver: gameOverLabel !== null, gameOverLabel,
           text: text.slice(0, 300)};
 }"""
 
@@ -559,10 +576,15 @@ def play_one_move(bridge: Bridge, engine: Engine, args) -> str:
         print(f"  !! board read failed: {err}")
         return "read-failed"
     if read.game_over:
+        if args.verbose:
+            print(f"  game-over signalled by: "
+                  f"{read.raw.get('gameOverLabel')!r}")
         return "game-over"
     # A finished board can linger on screen with a pawn already home. Searching
     # from a decided position yields no move at all, so treat it as over.
     if fr.winner(read.state) >= 0:
+        if args.verbose:
+            print("  game-over: a pawn is already on its goal row")
         return "game-over"
     if read.walls_expected >= 0 and read.walls_seen != read.walls_expected:
         # A wall placed moments ago may still be fading in (the slot child
