@@ -44,7 +44,10 @@ LEVELS: dict[str, dict[str, float]] = {
     "medium": {"sims": 320, "temperature": 0.0},
     "hard": {"sims": 800, "temperature": 0.0},
     "max": {"sims": 2000, "temperature": 0.0},
+    "ultra": {"sims": 4096, "temperature": 0.0},
 }
+# Levels that play at full strength from move one (no opening variety noise).
+FULL_STRENGTH_LEVELS = ("max", "ultra")
 MAX_SIMS = max(int(cfg["sims"]) for cfg in LEVELS.values())
 
 EVAL_SIMS = 192   # coach-mode evaluation search, precomputed per human turn
@@ -211,7 +214,7 @@ class GameSession:
 
             cfg = LEVELS[self.level]
             temp = float(cfg["temperature"])
-            if len(self.log) < OPENING_PLIES and self.level != "max":
+            if len(self.log) < OPENING_PLIES and self.level not in FULL_STRENGTH_LEVELS:
                 temp = max(temp, OPENING_TEMP)
             action, value, _ = self._search(int(cfg["sims"]), temperature=temp)
             # `value` is from the engine's (side to move) perspective.
