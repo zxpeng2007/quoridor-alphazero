@@ -1,0 +1,39 @@
+# --- Claude Code artifacts -------------------------------------------------
+CLAUDE.md
+**/CLAUDE.md
+*.claude.md
+.claude/
+.claude*/
+
+# --- Python ----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Training artifacts ----------------------------------------------------
+# Released weights ARE tracked (see checkpoints/ below); these are the large,
+# fully regenerable intermediates.
+data/
+checkpoints/buffer.npz
+checkpoints/smoke.pt
+*.npz
+!checkpoints/history.json
+
+# --- Scratch ---------------------------------------------------------------
+smoke.py
+scratch_*.py
+*.log
+.DS_Store
+Thumbs.db
