@@ -465,7 +465,15 @@ class Engine:
         return int(max(256, min(self.max_sims, budget * self.SIMS_PER_SEC)))
 
     def choose(self, st: np.ndarray, sims: int):
+        """Returns ``(action, value, visits)``; action is -1 if there is none.
+
+        A search from an already-decided position returns zero visits
+        everywhere, and argmax of an all-zero array is 0 -- which happens to be
+        a wall placement. Report "no move" instead of inventing one.
+        """
         visits = self.mcts.search(st.reshape(1, -1).copy(), sims)[0]
+        if visits.sum() <= 0:
+            return -1, 0.0, visits
         return int(visits.argmax()), float(self.mcts.root_value()[0]), visits
 
 
@@ -502,6 +510,10 @@ def play_one_move(bridge: Bridge, engine: Engine, args) -> str:
         print(f"  !! board read failed: {err}")
         return "read-failed"
     if read.game_over:
+        return "game-over"
+    # A finished board can linger on screen with a pawn already home. Searching
+    # from a decided position yields no move at all, so treat it as over.
+    if fr.winner(read.state) >= 0:
         return "game-over"
     if read.walls_expected >= 0 and read.walls_seen != read.walls_expected:
         # A wall placed moments ago may still be fading in (the slot child
@@ -576,6 +588,8 @@ def play_one_move(bridge: Bridge, engine: Engine, args) -> str:
     t0 = time.perf_counter()
     action, value, visits = engine.choose(read.state, sims)
     think = time.perf_counter() - t0
+    if action < 0:
+        return "no-move"
     if not mask[action]:
         print("  !! engine chose an action illegal in the read position")
         return "illegal"
@@ -659,6 +673,10 @@ def main() -> None:
         games = 0
         last_note = 0.0
         last_status = ""
+        # A finished board stays on screen until the next game starts, so the
+        # game-over signal repeats. Count a result once, then require a live
+        # board again before another can be counted.
+        result_counted = False
         while not (stopping["flag"] or STOP_FILE.exists()):
             if args.max_games and games >= args.max_games:
                 print(f"reached --max-games {args.max_games}")
@@ -667,7 +685,7 @@ def main() -> None:
 
             # Never sit silent: say what we are waiting for, at most every 5s.
             if status in ("no-board", "not-our-turn", "turn-unknown",
-                          "no-legal-moves"):
+                          "no-legal-moves", "no-move"):
                 now = time.time()
                 if now - last_note > 5.0 or status != last_status:
                     reason = {
@@ -675,6 +693,7 @@ def main() -> None:
                         "not-our-turn": "opponent to move (no highlighted cells)",
                         "turn-unknown": "cannot tell whose turn it is",
                         "no-legal-moves": "no legal moves in the read position",
+                        "no-move": "position is already decided",
                     }[status]
                     print(f"  waiting: {reason}")
                     last_note, last_status = now, status
@@ -696,14 +715,18 @@ def main() -> None:
                 print("\nDry run: compare the board above with your screen.")
                 break
             if status == "game-over":
-                games += 1
-                print(f"game finished ({games})\n")
-                page.wait_for_timeout(4000)
+                if not result_counted:
+                    games += 1
+                    result_counted = True
+                    print(f"game finished ({games}) -- waiting for the next game\n")
+                page.wait_for_timeout(2500)
                 continue
             if status in ("no-board", "not-our-turn", "turn-unknown",
-                          "no-legal-moves"):
+                          "no-legal-moves", "no-move"):
                 page.wait_for_timeout(700)
                 continue
+            if status == "played":
+                result_counted = False   # a live board again
 
         print(f"stopped after {games} completed game(s)")
         if STOP_FILE.exists():
