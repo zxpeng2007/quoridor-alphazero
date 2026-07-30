@@ -379,6 +379,55 @@ class Bridge:
         self.page.mouse.click(target[0], target[1])
         return True
 
+    def _click_text(self, patterns: tuple[str, ...], timeout: float = 4000) -> str | None:
+        """Click the first visible button/link whose text matches any pattern."""
+        for pat in patterns:
+            for role in ("button", "link"):
+                loc = self.page.get_by_role(role, name=re.compile(pat, re.I))
+                try:
+                    if loc.count():
+                        loc.first.click(timeout=timeout)
+                        return pat
+                except Exception:
+                    continue
+        return None
+
+    def back_to_lobby_and_queue(self, wait_s: float = 120.0) -> bool:
+        """Leave a finished game and queue for the next ranked match.
+
+        Returns True once a board is on screen again.
+        """
+        hit = self._click_text((r"back to lobby", r"^lobby$"))
+        if hit is None:
+            # The end screen varies; going to the lobby directly always works.
+            self.page.goto(f"{BASE}/", wait_until="domcontentloaded", timeout=45000)
+        self.page.wait_for_timeout(1500)
+
+        # Make sure the ranked tab is the selected mode, then start matchmaking.
+        self._click_text((r"^ranked$",))
+        self.page.wait_for_timeout(400)
+        started = self._click_text((r"find ranked match", r"find match",
+                                    r"^play now$"))
+        if started is None:
+            print("  !! could not find the ranked matchmaking button; "
+                  "start a game manually and it will be picked up")
+            return False
+        print(f"  queued for a ranked match ({started!r}); waiting for pairing...")
+
+        deadline = time.time() + wait_s
+        while time.time() < deadline:
+            if STOP_FILE.exists():
+                return False
+            try:
+                self.page.wait_for_selector('[data-testid="slot-horizontal-0-0"]',
+                                            timeout=2000)
+                self.page.wait_for_timeout(1200)   # let the board settle
+                return True
+            except Exception:
+                continue
+        print("  !! no match found within the wait window")
+        return False
+
     def _tray_piece(self, want_horizontal: bool) -> dict | None:
         """Locate a draggable barricade piece, expanding the tray if collapsed."""
         for attempt in range(2):
@@ -641,6 +690,8 @@ def main() -> None:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--url", default=f"{BASE}/")
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--no-requeue", dest="requeue", action="store_false",
+                    help="do not auto-queue the next ranked game after a result")
     args = ap.parse_args()
 
     from playwright.sync_api import sync_playwright
@@ -718,8 +769,18 @@ def main() -> None:
                 if not result_counted:
                     games += 1
                     result_counted = True
-                    print(f"game finished ({games}) -- waiting for the next game\n")
-                page.wait_for_timeout(2500)
+                    print(f"game finished ({games})")
+                if args.max_games and games >= args.max_games:
+                    continue          # loop head will stop us
+                if args.requeue:
+                    page.wait_for_timeout(1500)
+                    if bridge.back_to_lobby_and_queue():
+                        print("  new game started\n")
+                        result_counted = False
+                    else:
+                        page.wait_for_timeout(3000)
+                else:
+                    page.wait_for_timeout(2500)
                 continue
             if status in ("no-board", "not-our-turn", "turn-unknown",
                           "no-legal-moves", "no-move"):
