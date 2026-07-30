@@ -1,0 +1,48 @@
+﻿chain rungs @ 200 sims: bootstrap -> gen-000 -> gen-003 -> gen-005 -> gen-006 -> gen-008 -> gen-010
+device: cuda
+
+generation chain:
+  gen-000 vs bootstrap: +122 -6 =0 (95.3%)  Elo +498 +/- 132  [81 plies avg]   [147s]
+  gen-003 vs gen-000: +114 -14 =0 (89.1%)  Elo +354 +/- 93  [64 plies avg]   [132s]
+  gen-005 vs gen-003: +110 -18 =0 (85.9%)  Elo +307 +/- 85  [64 plies avg]   [131s]
+  gen-006 vs gen-005: +78 -50 =0 (60.9%)  Elo +76 +/- 61  [77 plies avg]   [408s]
+  gen-008 vs gen-006: +112 -16 =0 (87.5%)  Elo +329 +/- 89  [63 plies avg]   [134s]
+  gen-010 vs gen-008: +122 -6 =0 (95.3%)  Elo +498 +/- 132  [65 plies avg]   [113s]
+bootstrap sims ladder:
+  bootstrap vs bootstrap@64: +128 -0 =0 (100.0%)  Elo +844 +/- 342  [97 plies avg]   [excluded from fit: saturated]   [84s]
+  bootstrap@64 vs bootstrap@16: +64 -64 =0 (50.0%)  Elo -0 +/- 60  [93 plies avg]   [26s]
+classical anchors:
+  bootstrap@16 vs heuristic-d2: +32 -32 =0 (50.0%)  Elo -0 +/- 84  [95 plies avg]   [8s]
+  bootstrap@16 vs heuristic-d3: +32 -32 =0 (50.0%)  Elo -0 +/- 84  [77 plies avg]   [12s]
+  bootstrap@64 vs heuristic-d3: +32 -32 =0 (50.0%)  Elo -0 +/- 84  [81 plies avg]   [24s]
+cross-checks:
+  gen-010 vs heuristic-d3: +64 -0 =0 (100.0%)  Elo +725 +/- 343  [61 plies avg]   [excluded from fit: saturated]   [61s]
+  gen-010@800 vs gen-010: +124 -4 =0 (96.9%)  Elo +559 +/- 155  [69 plies avg]   [653s]
+python : Traceback (most recent call last):
+At line:3 char:1
++ python tools/evaluate.py --games 128 --agent-games 64 --sims 200 2>&1 ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Traceback (most recent call last)::String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+  File "C:\Users\StevenPeng\Documents\Claude\Projects\barricade\tools\evaluate.py", line 210, in <module>
+    main()
+  File "C:\Users\StevenPeng\Documents\Claude\Projects\barricade\tools\evaluate.py", line 171, in main
+    for r, _, _ in results:
+        ^^^^^^^
+TypeError: cannot unpack non-iterable MatchResult object
+excluded (saturated): bootstrap vs bootstrap@64  100.0%
+excluded (saturated): gen-010 vs heuristic-d3  100.0%
+
+rung                Elo (bootstrap=0)
+--------------------------------------
+gen-010@800                     +2621
+gen-010                         +2061
+gen-008                         +1563
+gen-006                         +1234
+gen-005                         +1158
+gen-003                          +852
+gen-000                          +498
+bootstrap                          +0
+
+unrated (no informative path to anchor): bootstrap@64, bootstrap@16, heuristic-d2, heuristic-d3

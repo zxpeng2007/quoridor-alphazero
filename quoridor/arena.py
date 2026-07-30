@@ -252,6 +252,7 @@ def batched_match(
     temperature: float = 1.0,
     max_nodes: int | None = None,
     seed: int = 0,
+    sims_b: int | None = None,
 ) -> MatchResult:
     """Play ``games`` neural-vs-neural games concurrently, sharing GPU batches.
 
@@ -266,10 +267,14 @@ def batched_match(
     from quoridor.mcts import BatchedMCTS  # local: keeps torch out of CPU workers
 
     rng = np.random.default_rng(seed)
-    nodes = max_nodes if max_nodes is not None else sims + 64
-    mcts_a = BatchedMCTS(evaluator_a, n_games=games, max_nodes=nodes,
+    # ``sims_b`` lets the two sides search at different depths, e.g. to use a
+    # low-sim version of a network as an intermediate ladder rung.
+    sims_b = sims if sims_b is None else sims_b
+    nodes_a = max_nodes if max_nodes is not None else sims + 64
+    nodes_b = max_nodes if max_nodes is not None else sims_b + 64
+    mcts_a = BatchedMCTS(evaluator_a, n_games=games, max_nodes=nodes_a,
                          c_puct=c_puct, fpu_reduction=fpu_reduction, seed=seed)
-    mcts_b = BatchedMCTS(evaluator_b, n_games=games, max_nodes=nodes,
+    mcts_b = BatchedMCTS(evaluator_b, n_games=games, max_nodes=nodes_b,
                          c_puct=c_puct, fpu_reduction=fpu_reduction, seed=seed + 1)
 
     states = np.stack([fr.initial_state() for _ in range(games)])
@@ -284,11 +289,14 @@ def batched_match(
         if not active.any():
             break
         mover_is_a = a_is_first == (ply % 2 == 0)
-        for mcts, sel in ((mcts_a, active & mover_is_a), (mcts_b, active & ~mover_is_a)):
+        for mcts, side_sims, sel in (
+            (mcts_a, sims, active & mover_is_a),
+            (mcts_b, sims_b, active & ~mover_is_a),
+        ):
             idx = np.nonzero(sel)[0]
             if not len(idx):
                 continue
-            visits = mcts.search(states[idx], sims)
+            visits = mcts.search(states[idx], side_sims)
             for k, g in enumerate(idx):
                 total = visits[k].sum()
                 if total <= 0:
