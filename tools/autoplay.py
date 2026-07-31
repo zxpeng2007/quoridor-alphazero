@@ -591,23 +591,37 @@ class Bridge:
 
 
 class Engine:
+    # Leaves gathered per network call. Raising this raises the raw simulation
+    # rate -- 32 -> 79k sims/s, 512 -> 113k, 1024 -> 119k on this machine --
+    # but the extra simulations are worse ones: a batch of N leaves is selected
+    # before any of them is evaluated, so most selections are made on stale
+    # statistics. Measured head to head at equal time, leaf_batch 1024 loses
+    # heavily to 32 despite searching ~1.5x more nodes. Rate is not strength;
+    # 32 is kept because it is the setting that actually wins games.
     LEAF = 32
     # Starting guess for search throughput, refined from real timings as the
     # game goes on. Search rate varies with position (a crowded board with many
     # walls is slower), so a fixed constant either overshoots the clock or
     # leaves depth unused.
-    SIMS_PER_SEC = 22000
+    SIMS_PER_SEC = 79000
 
     def __init__(self, checkpoint: str, device: str, max_sims: int,
-                 think_seconds: float = 3.5):
+                 think_seconds: float = 3.5, leaf_batch: int | None = None,
+                 c_puct: float = 1.6, fpu_reduction: float = 0.2):
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else "cpu"
         torch.backends.cudnn.benchmark = True
         fr.warmup()
         net, self.meta = load_checkpoint(checkpoint, device)
-        ev = NetEvaluator(net, device=device, graph_batches=(1, self.LEAF))
-        self.mcts = BatchedMCTS(ev, n_games=1, max_nodes=max_sims + 256,
-                                leaf_batch=self.LEAF)
+        leaf = int(leaf_batch or self.LEAF)
+        ev = NetEvaluator(net, device=device, graph_batches=(leaf,))
+        # c_puct and fpu_reduction trade breadth against depth: lowering c_puct
+        # or raising fpu_reduction makes the search commit to fewer lines and
+        # follow them further, without touching the leaf batch.
+        self.mcts = BatchedMCTS(ev, n_games=1, max_nodes=max_sims + leaf + 256,
+                                leaf_batch=leaf, c_puct=c_puct,
+                                fpu_reduction=fpu_reduction)
+        self.leaf = leaf
         self.max_sims = max_sims
         self.think_seconds = think_seconds
         self.rate = float(self.SIMS_PER_SEC)
@@ -906,8 +920,18 @@ def main() -> None:
     ap.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
     ap.add_argument("--think-seconds", type=float, default=3.5,
                     help="target thinking time per move (default 3.5)")
-    ap.add_argument("--max-sims", type=int, default=131072,
-                    help="ceiling on simulations per move; memory scales with it")
+    ap.add_argument("--max-sims", type=int, default=700_000,
+                    help="ceiling on simulations per move; memory scales with "
+                         "it (~2.5 KB per node, so 700k nodes is ~1.8 GB)")
+    ap.add_argument("--leaf-batch", type=int, default=Engine.LEAF,
+                    help="leaves per network call; raises the raw rate but "
+                         "lowers the quality of each simulation")
+    ap.add_argument("--c-puct", type=float, default=1.6,
+                    help="exploration constant; lower searches fewer lines "
+                         "more deeply")
+    ap.add_argument("--fpu", type=float, default=0.2,
+                    help="first-play-urgency reduction; higher concentrates "
+                         "the search on already-promising moves")
     ap.add_argument("--max-games", type=int, default=0, help="0 = until stopped")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--url", default=f"{BASE}/")
@@ -923,7 +947,9 @@ def main() -> None:
 
     print("loading engine...")
     engine = Engine(args.checkpoint, args.device, args.max_sims,
-                    think_seconds=args.think_seconds)
+                    think_seconds=args.think_seconds,
+                    leaf_batch=args.leaf_batch,
+                    c_puct=args.c_puct, fpu_reduction=args.fpu)
     m = engine.meta
     print(f"engine: {m.get('checkpoint', args.checkpoint)} "
           f"(gen {m.get('iteration', '?')}, {m.get('elo', 0):+.0f} Elo internal)")
