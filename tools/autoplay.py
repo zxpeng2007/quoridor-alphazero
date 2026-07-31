@@ -664,14 +664,25 @@ def play_one_move(bridge: Bridge, engine: Engine, args) -> str:
         print(f"  !! board read failed: {err}")
         return "read-failed"
     banner = read.raw.get("gameOverLabel")
+
+    # The result banner is authoritative and final. A visible Victory/Defeat/
+    # Draw banner, or a Rematch button, appears only once a game is decided --
+    # interactive controls and hidden promos are already excluded from matching.
+    # Return immediately: a finished board is not a position, and running
+    # liveness or legality checks over its leftover decorations only invents
+    # reasons to abort a game that is already won or lost.
+    if read.game_over:
+        if args.verbose:
+            print(f"  game-over: banner {banner!r}")
+        return "game-over"
+
     won = fr.winner(read.state)
 
-    # A finished game always shows a result banner, so the banner is the
-    # authority on whether a game is over. A pawn apparently standing on a goal
-    # row with no banner is therefore a misread, not a result -- believing it
-    # abandoned freshly started games. Re-read; if it persists, fail loudly
-    # rather than silently leaving a live game.
-    if won >= 0 and not read.game_over:
+    # No banner, but a pawn appears to be home. A real result always shows a
+    # banner, so this is a misread -- believing it abandoned freshly started
+    # games. Re-read; if it persists, fail loudly rather than silently leaving
+    # a live game.
+    if won >= 0:
         settled = None
         for _ in range(6):
             bridge.page.wait_for_timeout(400)
@@ -692,22 +703,12 @@ def play_one_move(bridge: Bridge, engine: Engine, args) -> str:
             print(render(read.state))
             return "read-failed"
         read = settled
-        banner = read.raw.get("gameOverLabel")
-        won = fr.winner(read.state)
-
-    if read.game_over:
-        # Highlights mean the side to move has moves, so the game is live --
-        # unless a pawn is genuinely home, in which case the result stands.
-        if read.our_turn and won < 0:
-            print(f"  ignoring a game-over banner ({banner!r}): it is our turn "
-                  f"with {len(read.highlights)} legal moves, so the game is live")
+        # The re-read either produced a banner (a genuine result) or a position
+        # with nobody home (the earlier read was transient).
+        if read.game_over:
             if args.verbose:
-                print(render(read.state))
-        else:
-            if args.verbose:
-                detail = (f"{'we' if won == read.us else 'opponent'} reached the "
-                          f"goal row" if won >= 0 else f"banner {banner!r}")
-                print(f"  game-over: {detail}")
+                print(f"  game-over: banner "
+                      f"{read.raw.get('gameOverLabel')!r}")
             return "game-over"
     if read.walls_expected >= 0 and read.walls_seen != read.walls_expected:
         # A wall placed moments ago may still be fading in (the slot child
