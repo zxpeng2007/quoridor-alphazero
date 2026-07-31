@@ -666,7 +666,35 @@ def render(st: np.ndarray) -> str:
     return s.render()
 
 
+# Statuses that mean something went wrong and the game should be abandoned.
+FAILURE_STATUSES = frozenset({
+    "read-failed", "inconsistent", "illegal", "legality-mismatch",
+    "wall-place-failed", "pawn-click-failed", "unconfirmed",
+})
+
+
 def play_one_move(bridge: Bridge, engine: Engine, args) -> str:
+    """One move, with a final check that any failure is not just the game ending.
+
+    A result can land at any instant, including between deciding on a move and
+    completing it, and a finished board breaks every assumption at once: the
+    barricade tray disappears, highlights become decoration, clicks stop
+    registering. Rather than special-casing each place that can notice, every
+    failure is re-examined here -- if a result banner is up, the game simply
+    ended, and that is the explanation rather than a fault.
+    """
+    status = _play_one_move(bridge, engine, args)
+    if status in FAILURE_STATUSES:
+        dom = bridge.snapshot()
+        if dom is not None and dom.get("gameOver"):
+            if args.verbose:
+                print(f"  ({status} was the game ending: "
+                      f"{dom.get('gameOverLabel')!r})")
+            return "game-over"
+    return status
+
+
+def _play_one_move(bridge: Bridge, engine: Engine, args) -> str:
     dom = bridge.snapshot()
     if dom is None:
         return "no-board"
@@ -944,9 +972,7 @@ def main() -> None:
                     print(f"  waiting: {reason}")
                     last_note, last_status = now, status
 
-            if status in ("read-failed", "inconsistent", "illegal",
-                          "legality-mismatch", "wall-place-failed",
-                          "pawn-click-failed", "unconfirmed"):
+            if status in FAILURE_STATUSES:
                 print(f"  aborting: {status}")
                 if args.verbose:
                     dom = bridge.snapshot()
