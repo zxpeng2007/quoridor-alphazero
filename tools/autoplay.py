@@ -849,7 +849,17 @@ def play_one_move(bridge: Bridge, engine: Engine, args) -> str:
     for _ in range(16):
         bridge.page.wait_for_timeout(250)
         dom2 = bridge.snapshot()
-        after, _ = bridge.decode(dom2) if dom2 else (None, "")
+        if dom2 is None:
+            continue
+        # The game can end while we are confirming: the opponent resigns, or
+        # our own move wins it. That is a result, not a failure to register --
+        # and a finished board may not decode at all, so check before decoding.
+        if dom2.get("gameOver"):
+            if args.verbose:
+                print(f"  game ended while confirming: "
+                      f"{dom2.get('gameOverLabel')!r}")
+            return "game-over"
+        after, _ = bridge.decode(dom2)
         if after is None:
             continue
         if want_wall is None:
