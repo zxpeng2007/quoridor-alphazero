@@ -592,11 +592,14 @@ class Bridge:
 
 class Engine:
     LEAF = 32
-    # Measured on a real mid-game position with a cold tree (the synthetic
-    # benchmark's 38k/s does not survive contact with a fresh root).
-    SIMS_PER_SEC = 19000
+    # Starting guess for search throughput, refined from real timings as the
+    # game goes on. Search rate varies with position (a crowded board with many
+    # walls is slower), so a fixed constant either overshoots the clock or
+    # leaves depth unused.
+    SIMS_PER_SEC = 22000
 
-    def __init__(self, checkpoint: str, device: str, max_sims: int):
+    def __init__(self, checkpoint: str, device: str, max_sims: int,
+                 think_seconds: float = 3.5):
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else "cpu"
         torch.backends.cudnn.benchmark = True
@@ -606,15 +609,20 @@ class Engine:
         self.mcts = BatchedMCTS(ev, n_games=1, max_nodes=max_sims + 256,
                                 leaf_batch=self.LEAF)
         self.max_sims = max_sims
+        self.think_seconds = think_seconds
+        self.rate = float(self.SIMS_PER_SEC)
 
     def sims_for(self, clock: float | None, increment: float = 3.0) -> int:
-        """Whichever is tighter: a little over the increment, or clock/20.
+        """Simulations to fit the target think time, backed off in time trouble.
 
-        Earlier ranked games averaged 8.7 s/move against opponents playing at
-        2.7 s. Losing on time is a real way to lose these games.
+        The clock/20 ceiling keeps a low clock safe: earlier ranked games
+        averaged 8.7 s/move against opponents playing at 2.7 s, and losing on
+        time is a real way to lose these games.
         """
-        budget = increment if clock is None else min(1.2 * increment, clock / 20.0)
-        return int(max(256, min(self.max_sims, budget * self.SIMS_PER_SEC)))
+        target = self.think_seconds
+        if clock is not None:
+            target = min(target, clock / 20.0)
+        return int(max(256, min(self.max_sims, target * self.rate)))
 
     def choose(self, st: np.ndarray, sims: int):
         """Returns ``(action, value, visits)``; action is -1 if there is none.
@@ -623,7 +631,12 @@ class Engine:
         everywhere, and argmax of an all-zero array is 0 -- which happens to be
         a wall placement. Report "no move" instead of inventing one.
         """
+        t0 = time.perf_counter()
         visits = self.mcts.search(st.reshape(1, -1).copy(), sims)[0]
+        dt = time.perf_counter() - t0
+        if dt > 0.05:
+            # Track observed throughput so the next move hits the target time.
+            self.rate = 0.7 * self.rate + 0.3 * (sims / dt)
         if visits.sum() <= 0:
             return -1, 0.0, visits
         return int(visits.argmax()), float(self.mcts.root_value()[0]), visits
@@ -853,7 +866,10 @@ def main() -> None:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--checkpoint", default="checkpoints/best.pt")
     ap.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
-    ap.add_argument("--max-sims", type=int, default=32768)
+    ap.add_argument("--think-seconds", type=float, default=3.5,
+                    help="target thinking time per move (default 3.5)")
+    ap.add_argument("--max-sims", type=int, default=131072,
+                    help="ceiling on simulations per move; memory scales with it")
     ap.add_argument("--max-games", type=int, default=0, help="0 = until stopped")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--url", default=f"{BASE}/")
@@ -868,7 +884,8 @@ def main() -> None:
         STOP_FILE.unlink()
 
     print("loading engine...")
-    engine = Engine(args.checkpoint, args.device, args.max_sims)
+    engine = Engine(args.checkpoint, args.device, args.max_sims,
+                    think_seconds=args.think_seconds)
     m = engine.meta
     print(f"engine: {m.get('checkpoint', args.checkpoint)} "
           f"(gen {m.get('iteration', '?')}, {m.get('elo', 0):+.0f} Elo internal)")
