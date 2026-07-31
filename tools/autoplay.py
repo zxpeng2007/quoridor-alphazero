@@ -76,8 +76,13 @@ BOARD_JS = r"""() => {
   const board = s00.parentElement;
   const bb = board.getBoundingClientRect();
   const r00 = s00.getBoundingClientRect(), r11 = s11.getBoundingClientRect();
-  const pitch = r11.x - r00.x, gap = r00.height, cell = pitch - gap;
-  const ox = r00.x, oy = r00.y - cell;
+  const pitch = Math.abs(r11.x - r00.x), gap = r00.height, cell = pitch - gap;
+  // Derive the grid origin from the board container, not from slot (0,0):
+  // rotating the board moves that slot to the opposite corner, which would
+  // shift every computed row and column and put pawns off the board.
+  const inner = cell + 8 * pitch;
+  const pad = (bb.width - inner) / 2;
+  const ox = bb.x + pad, oy = bb.y + pad;
 
   // Orientation from the rank labels. Demand a full, strictly monotonic run:
   // reading a partially rendered board could otherwise yield two labels in an
@@ -327,13 +332,16 @@ class Bridge:
         st[fr.WH_OFF:fr.WH_OFF + 64] = 0
         st[fr.WV_OFF:fr.WV_OFF + 64] = 0
 
+        # Wall slots are addressed by data-testid, which is the site's own
+        # logical coordinate and does not change when the board is rotated for
+        # the second seat -- only pawns and highlights, which are located by
+        # pixel position, need the orientation transform.
         for w in dom["walls"]:
             parts = w["tid"].split("-")
             if len(parts) != 4:
                 continue
             orientation, wr, wc = parts[1], int(parts[2]), int(parts[3])
-            if flipped:
-                wr = 7 - wr
+            wr = 7 - wr
             if not (0 <= wr < 8 and 0 <= wc < 8):
                 return None, f"wall slot out of range: {w['tid']}"
             off = fr.WH_OFF if orientation == "horizontal" else fr.WV_OFF
@@ -347,9 +355,9 @@ class Bridge:
             # legal-looking position for the wrong board, so wait instead.
             if abs(col_f - col) > 0.2 or abs(vrow_f - vrow) > 0.2:
                 return None, "wait: a pawn is between squares (animating)"
-            row = 8 - vrow if flipped else vrow
+            row, col = (8 - vrow, col) if flipped else (vrow, 8 - col)
             if not (0 <= row < 9 and 0 <= col < 9):
-                return None, f"pawn off board: {p}"
+                return None, f"pawn off board: {p} -> row {row} col {col}"
             by_colour[p["colour"]] = row * 9 + col
         if set(by_colour) != {"red", "blue"}:
             return None, (f"expected one red and one blue pawn, "
@@ -389,7 +397,7 @@ class Bridge:
         highlights: dict[int, tuple[float, float]] = {}
         for h in dom.get("highlights") or []:
             vrow, col = int(round(h["vrow"])), int(round(h["col"]))
-            row = 8 - vrow if flipped else vrow
+            row, col = (8 - vrow, col) if flipped else (vrow, 8 - col)
             if not (0 <= row < 9 and 0 <= col < 9):
                 continue
             cell = row * 9 + col
@@ -431,8 +439,9 @@ class Bridge:
     def cell_xy(self, cell: int, flipped: bool) -> tuple[float, float]:
         g = self.geo
         row, col = divmod(cell, 9)
-        vrow = 8 - row if flipped else row
-        return (g["ox"] + col * g["pitch"] + g["cell"] / 2,
+        # 180-degree rotation: both axes invert together.
+        vrow, vcol = (8 - row, col) if flipped else (row, 8 - col)
+        return (g["ox"] + vcol * g["pitch"] + g["cell"] / 2,
                 g["oy"] + vrow * g["pitch"] + g["cell"] / 2)
 
     def play_pawn(self, cell: int, read: "BoardRead") -> bool:
@@ -465,8 +474,19 @@ class Bridge:
     def back_to_lobby_and_queue(self, wait_s: float = 120.0) -> bool:
         """Leave a finished game and queue for the next ranked match.
 
-        Returns True once a board is on screen again.
+        Returns True once a board is on screen again. Returns False rather than
+        raising if the browser has gone away (e.g. Ctrl+C closed it mid-call).
         """
+        if self.page.is_closed():
+            return False
+        try:
+            return self._requeue(wait_s)
+        except Exception as exc:
+            if "closed" in str(exc).lower():
+                return False
+            raise
+
+    def _requeue(self, wait_s: float) -> bool:
         self._click_text((r"back to lobby", r"^lobby$"))
         # Confirm we actually reached the lobby rather than assuming the click
         # landed; otherwise the matchmaking button is looked for on a game page.
@@ -539,10 +559,10 @@ class Bridge:
         (verified against the live site). Selecting the tray piece first does
         not change that. Only the drag carries the orientation.
         """
+        # Slot testids are orientation-independent (see decode).
         orient, slot = divmod(action, fr.NUM_WALL_SLOTS)
         wr, wc = divmod(slot, 8)
-        if flipped:
-            wr = 7 - wr
+        wr = 7 - wr
         want_horizontal = orient == 0
         tid = f"slot-{'horizontal' if want_horizontal else 'vertical'}-{wr}-{wc}"
 
@@ -645,27 +665,49 @@ def play_one_move(bridge: Bridge, engine: Engine, args) -> str:
         return "read-failed"
     banner = read.raw.get("gameOverLabel")
     won = fr.winner(read.state)
-    if won >= 0:
-        # A pawn on its goal row is decisive. Orientation is only accepted from
-        # a complete, monotonic set of rank labels, so this cannot come from a
-        # mirrored read; stale highlights sometimes linger after the win and
-        # must not veto it.
-        if args.verbose:
-            print(f"  game-over: {'we' if won == read.us else 'opponent'} "
-                  f"reached the goal row")
-        return "game-over"
+
+    # A finished game always shows a result banner, so the banner is the
+    # authority on whether a game is over. A pawn apparently standing on a goal
+    # row with no banner is therefore a misread, not a result -- believing it
+    # abandoned freshly started games. Re-read; if it persists, fail loudly
+    # rather than silently leaving a live game.
+    if won >= 0 and not read.game_over:
+        settled = None
+        for _ in range(6):
+            bridge.page.wait_for_timeout(400)
+            dom_r = bridge.snapshot()
+            cand, _err = bridge.decode(dom_r) if dom_r else (None, "")
+            if cand is None:
+                continue
+            if cand.game_over or fr.winner(cand.state) < 0:
+                settled = cand
+                break
+        if settled is None:
+            print(f"  !! a pawn reads as being on its goal row but the page "
+                  f"shows no result banner -- refusing to treat this as a "
+                  f"finished game")
+            print(f"    decoded P0={int(read.state[fr.IDX_P0])} "
+                  f"P1={int(read.state[fr.IDX_P1])} flipped={read.flipped} "
+                  f"us={read.us} walls={read.walls_seen}")
+            print(render(read.state))
+            return "read-failed"
+        read = settled
+        banner = read.raw.get("gameOverLabel")
+        won = fr.winner(read.state)
+
     if read.game_over:
-        # A banner with no winner means resignation, timeout, or a stray match.
-        # Here the highlights are worth trusting: the site rings destinations
-        # only for the side to move, so their presence means the game is live.
-        if read.our_turn:
+        # Highlights mean the side to move has moves, so the game is live --
+        # unless a pawn is genuinely home, in which case the result stands.
+        if read.our_turn and won < 0:
             print(f"  ignoring a game-over banner ({banner!r}): it is our turn "
                   f"with {len(read.highlights)} legal moves, so the game is live")
             if args.verbose:
                 print(render(read.state))
         else:
             if args.verbose:
-                print(f"  game-over: banner {banner!r}")
+                detail = (f"{'we' if won == read.us else 'opponent'} reached the "
+                          f"goal row" if won >= 0 else f"banner {banner!r}")
+                print(f"  game-over: {detail}")
             return "game-over"
     if read.walls_expected >= 0 and read.walls_seen != read.walls_expected:
         # A wall placed moments ago may still be fading in (the slot child

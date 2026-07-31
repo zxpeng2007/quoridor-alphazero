@@ -36,8 +36,12 @@ BOARD_JS = r"""() => {
   const board = s00.parentElement;
   const bb = board.getBoundingClientRect();
   const r00 = s00.getBoundingClientRect(), r11 = s11.getBoundingClientRect();
-  const pitch = r11.x - r00.x, gap = r00.height, cell = pitch - gap;
-  const ox = r00.x, oy = r00.y - cell;
+  const pitch = Math.abs(r11.x - r00.x), gap = r00.height, cell = pitch - gap;
+  // Origin from the board container: rotating moves slot (0,0) to the far
+  // corner, so it cannot be used as the grid origin.
+  const inner = cell + 8 * pitch;
+  const pad = (bb.width - inner) / 2;
+  const ox = bb.x + pad, oy = bb.y + pad;
 
   // Orientation from the rank labels: never assume which way the board is drawn.
   // Must stay identical to autoplay.py: demand a full monotonic run of rank
@@ -112,13 +116,15 @@ def decode(dom: dict) -> tuple[np.ndarray | None, str]:
     st[fr.WH_OFF:fr.WH_OFF + 64] = 0
     st[fr.WV_OFF:fr.WV_OFF + 64] = 0
 
+    # Wall slots are addressed by data-testid, the site's logical coordinate,
+    # which does not change when the board is rotated. Only pixel-located
+    # things (pawns, highlights) need the orientation transform.
     for w in dom["walls"]:
         parts = w["tid"].split("-")
         if len(parts) != 4:
             continue
         orientation, wr, wc = parts[1], int(parts[2]), int(parts[3])
-        if flipped:
-            wr = 7 - wr
+        wr = 7 - wr
         if not (0 <= wr < 8 and 0 <= wc < 8):
             return None, f"wall slot out of range: {w['tid']}"
         off = fr.WH_OFF if orientation == "horizontal" else fr.WV_OFF
@@ -126,10 +132,11 @@ def decode(dom: dict) -> tuple[np.ndarray | None, str]:
 
     by_colour = {}
     for p in dom["pawns"]:
-        row = 8 - p["vrow"] if flipped else p["vrow"]
-        if not (0 <= row < 9 and 0 <= p["col"] < 9):
-            return None, f"pawn off board: {p}"
-        by_colour[p["colour"]] = row * 9 + p["col"]
+        vrow, vcol = int(round(p["vrow"])), int(round(p["col"]))
+        row, col = (8 - vrow, vcol) if flipped else (vrow, 8 - vcol)
+        if not (0 <= row < 9 and 0 <= col < 9):
+            return None, f"pawn off board: {p} -> row {row} col {col}"
+        by_colour[p["colour"]] = row * 9 + col
     if set(by_colour) != {"red", "blue"}:
         return None, f"expected one red and one blue pawn, got {list(by_colour)}"
 
@@ -161,6 +168,9 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("game", nargs="?", default="0jm2n3")
     ap.add_argument("--headless", action="store_true", default=True)
+    ap.add_argument("--rotate", action="store_true",
+                    help="rotate the board 180 first, reproducing the view the "
+                         "second seat sees (the reader must be orientation-blind)")
     args = ap.parse_args()
 
     rec = ag.fetch(args.game)
@@ -177,6 +187,16 @@ def main() -> None:
                   wait_until="domcontentloaded", timeout=45000)
         page.wait_for_selector('[data-testid="slot-horizontal-0-0"]', timeout=30000)
         page.wait_for_timeout(1500)
+
+        if args.rotate:
+            # Reproduce the second seat's view. The decoded position must be
+            # identical: orientation is presentation, not state.
+            try:
+                page.locator('button[title*="Rotate"]').first.click(timeout=5000)
+                page.wait_for_timeout(800)
+                print("  rotated the board 180 degrees")
+            except Exception:
+                raise SystemExit("could not find the rotate control")
 
         # The analysis page opens at the final position; rewind to the start.
         try:
