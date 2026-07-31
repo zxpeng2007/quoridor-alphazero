@@ -380,12 +380,22 @@ class Bridge:
             return None, (f"expected two barricade counters, found {len(bars)} "
                           "-- cannot tell how many walls remain")
 
+        # Highlights are trusted as proof the game is live, so decoration must
+        # not count. At game end the site pulses the winning pawn's own cell
+        # with the same ring classes as move highlights; a legal destination
+        # can never be an occupied square (jumps go over, never onto), so any
+        # highlight on a pawn's cell is decoration and is dropped.
+        occupied = {int(st[fr.IDX_P0]), int(st[fr.IDX_P1])}
         highlights: dict[int, tuple[float, float]] = {}
         for h in dom.get("highlights") or []:
             vrow, col = int(round(h["vrow"])), int(round(h["col"]))
             row = 8 - vrow if flipped else vrow
-            if 0 <= row < 9 and 0 <= col < 9:
-                highlights[row * 9 + col] = (h["cx"], h["cy"])
+            if not (0 <= row < 9 and 0 <= col < 9):
+                continue
+            cell = row * 9 + col
+            if cell in occupied:
+                continue
+            highlights[cell] = (h["cx"], h["cy"])
 
         return BoardRead(state=st, flipped=flipped, us=us,
                          walls_seen=len(dom["walls"]),
