@@ -31,7 +31,7 @@ import torch
 from quoridor import fastrules as fr
 from quoridor.arena import batched_match, score_to_elo
 from quoridor.net import NetConfig, NetEvaluator, QuoridorNet, load_checkpoint, save_checkpoint
-from quoridor.replay import ReplayBuffer
+from quoridor.replay import MixedBuffer, ReplayBuffer
 from quoridor.selfplay import SelfPlayConfig, SelfPlayEngine
 from quoridor.train import Trainer, TrainConfig
 
@@ -91,6 +91,14 @@ def main() -> None:
     ap.add_argument("--c-puct", type=float, default=1.6)
     ap.add_argument("--fpu", type=float, default=0.2)
     ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--mined", default="",
+                    help="npz of deep-search-labelled positions from "
+                         "tools/mine_disagreements.py, oversampled into training")
+    ap.add_argument("--mined-frac", type=float, default=0.25,
+                    help="fraction of each batch drawn from the mined set")
+    ap.add_argument("--mined-holdout", default="",
+                    help="held-out mined npz; value MAE on it is reported every "
+                         "iteration, since the 200-sim gates cannot see this repair")
     args = ap.parse_args()
 
     out = Path(args.out_dir)
@@ -142,6 +150,23 @@ def main() -> None:
         buffer = ReplayBuffer.load(str(buf_path), capacity=args.buffer)
         print(f"resumed replay buffer: {len(buffer):,} positions\n")
 
+    train_source = buffer
+    if args.mined:
+        blob = np.load(args.mined)
+        repair = ReplayBuffer(capacity=max(len(blob["states"]), 1))
+        repair.add(blob["states"], blob["policies"], blob["values"])
+        train_source = MixedBuffer(buffer, repair, frac=args.mined_frac)
+        print(f"repair set: {len(repair):,} mined positions, "
+              f"{100 * args.mined_frac:.0f}% of every batch")
+
+    holdout = None
+    if args.mined_holdout:
+        hb = np.load(args.mined_holdout)
+        holdout = (hb["states"], hb["values"].astype(np.float32))
+        gap = np.abs(hb["raw"] - hb["values"]).mean() if "raw" in hb else float("nan")
+        print(f"value gate: {len(holdout[0]):,} held-out positions, "
+              f"raw-vs-deep MAE at mining time {gap:.3f}\n")
+
     sp_cfg = SelfPlayConfig(
         n_parallel=args.parallel, sims=args.sims, c_puct=args.c_puct, seed=start_iter
     )
@@ -169,8 +194,14 @@ def main() -> None:
             device=device,
         )
         t0 = time.perf_counter()
-        stats = trainer.train_on_buffer(buffer, args.steps_per_iter)
+        stats = trainer.train_on_buffer(train_source, args.steps_per_iter)
         print(f"  train ({time.perf_counter() - t0:.0f}s): {stats}")
+
+        gate_mae = float("nan")
+        if holdout is not None:
+            gate_mae = trainer.value_mae_on(holdout[0], holdout[1])
+            print(f"  value gate: MAE {gate_mae:.3f} on held-out "
+                  f"disagreement positions")
 
         # 3. gate promotion on a head-to-head match against the incumbent
         t0 = time.perf_counter()
@@ -222,6 +253,7 @@ def main() -> None:
             "value_loss": stats.value_loss,
             "policy_top1": stats.policy_acc,
             "value_mae": stats.value_mae,
+            "gate_value_mae": gate_mae,
             "mean_plies": batch.stats.mean_plies,
             "p0_win_rate": batch.stats.p0_win_rate,
             "seconds": time.perf_counter() - t_iter,

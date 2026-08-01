@@ -175,3 +175,42 @@ class ReplayBuffer:
         buf.add(blob["states"], blob["policies"], blob["values"])
         buf.total_added = int(blob["total_added"]) if "total_added" in blob else buf.size
         return buf
+
+
+class MixedBuffer:
+    """Self-play positions plus an oversampled repair set, in fixed proportion.
+
+    Mined positions number a few thousand against a two-million-position
+    self-play buffer. Sampled uniformly they would reach the network only a
+    handful of times before the ring evicts them -- nowhere near enough to move a
+    value output that is wrong by 0.7. What decides whether a value error gets
+    corrected is how often the network is shown the position, and that has to be
+    set deliberately rather than left to the repair set's share of the buffer.
+
+    Exposes the same ``sample`` contract as :class:`ReplayBuffer`, so the trainer
+    needs no changes.
+    """
+
+    def __init__(self, main: ReplayBuffer, repair: ReplayBuffer,
+                 frac: float = 0.25):
+        if not 0.0 <= frac < 1.0:
+            raise ValueError(f"frac must be in [0, 1), got {frac}")
+        self.main = main
+        self.repair = repair
+        self.frac = frac
+
+    def __len__(self) -> int:
+        return len(self.main)
+
+    @property
+    def total_added(self) -> int:
+        return self.main.total_added
+
+    def sample(self, batch_size: int, augment: bool = True):
+        n_rep = int(round(batch_size * self.frac))
+        if len(self.repair) == 0 or n_rep == 0:
+            return self.main.sample(batch_size, augment)
+        n_rep = min(n_rep, batch_size - 1)
+        a = self.main.sample(batch_size - n_rep, augment)
+        b = self.repair.sample(n_rep, augment)
+        return tuple(np.concatenate([x, y], axis=0) for x, y in zip(a, b))

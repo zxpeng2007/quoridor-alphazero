@@ -13,5 +13,50 @@
     "name": "gen-005",
     "path": "checkpoints\\refs\\ref-005.pt",
     "elo": 933.781500460372
+  },
+  {
+    "name": "gen-009",
+    "path": "checkpoints\\refs\\ref-009.pt",
+    "elo": 1357.0144629205306
+  },
+  {
+    "name": "gen-010",
+    "path": "checkpoints\\refs\\ref-010.pt",
+    "elo": 1738.7114666962605
+  },
+  {
+    "name": "gen-011",
+    "path": "checkpoints\\refs\\ref-011.pt",
+    "elo": 2162.9906028377054
+  },
+  {
+    "name": "gen-014",
+    "path": "checkpoints\\refs\\ref-014.pt",
+    "elo": 2587.26973897915
+  },
+  {
+    "name": "gen-018",
+    "path": "checkpoints\\refs\\ref-018.pt",
+    "elo": 2968.96674275488
+  },
+  {
+    "name": "gen-020",
+    "path": "checkpoints\\refs\\ref-020.pt",
+    "elo": 3257.030464117263
+  },
+  {
+    "name": "gen-021",
+    "path": "checkpoints\\refs\\ref-021.pt",
+    "elo": 3638.7274678929925
+  },
+  {
+    "name": "gen-023",
+    "path": "checkpoints\\refs\\ref-023.pt",
+    "elo": 3926.7911892553752
+  },
+  {
+    "name": "gen-024",
+    "path": "checkpoints\\refs\\ref-024.pt",
+    "elo": 4351.07032539682
   }
 ]

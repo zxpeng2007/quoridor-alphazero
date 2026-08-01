@@ -592,7 +592,7 @@ class Bridge:
 
 class Engine:
     # Leaves gathered per network call. Raising this raises the raw simulation
-    # rate -- 32 -> 79k sims/s, 512 -> 113k, 1024 -> 119k on this machine --
+    # rate -- 32 -> 24k sims/s, 512 -> 42k, 1024 -> 43k on this machine --
     # but the extra simulations are worse ones: a batch of N leaves is selected
     # before any of them is evaluated, so most selections are made on stale
     # statistics. Measured head to head at equal time, leaf_batch 1024 loses
@@ -603,7 +603,24 @@ class Engine:
     # game goes on. Search rate varies with position (a crowded board with many
     # walls is slower), so a fixed constant either overshoots the clock or
     # leaves depth unused.
-    SIMS_PER_SEC = 79000
+    #
+    # This must be the END-TO-END rate, and it can only be obtained by timing a
+    # real search. Measured at leaf_batch 32: 22k sims/s in the opening, 32-35k
+    # once walls are on the board (45 us and 30 us per simulation). Seeded at
+    # the opening end, because overshooting spends clock that cannot be
+    # recovered while undershooting only costs a little depth on the first move
+    # or two. Re-measured on gen-24 and unchanged from gen-16, as expected: the
+    # architecture is the same, so only the weights differ.
+    #
+    # Do NOT re-derive this from the parts. Timed in isolation a simulation is
+    # 14 us of CPU (selection, backup, encoding) and 20 us of GPU inference, and
+    # they are serialised -- but 34 us is not what the whole costs, because
+    # neither part runs in isolation during a real search. Trusting the parts
+    # gives ~29k/s and overshoots every opening move. This constant was 79000
+    # for exactly that reason: that is the tree-walk rate with the network taken
+    # out, and budgeting with it asked for 276k simulations and spent 8.3 s on
+    # the first move of a 3.5 s budget.
+    SIMS_PER_SEC = 22000
 
     def __init__(self, checkpoint: str, device: str, max_sims: int,
                  think_seconds: float = 3.5, leaf_batch: int | None = None,
@@ -625,6 +642,10 @@ class Engine:
         self.max_sims = max_sims
         self.think_seconds = think_seconds
         self.rate = float(self.SIMS_PER_SEC)
+        # Capture the CUDA graph and compile the search kernels now, while no
+        # clock is running. Without this the cost lands on the first move of the
+        # first game, which then overruns its time budget by about a second.
+        self.mcts.search(fr.initial_state().reshape(1, -1), 2048)
 
     def sims_for(self, clock: float | None, increment: float = 3.0) -> int:
         """Simulations to fit the target think time, backed off in time trouble.
@@ -920,9 +941,12 @@ def main() -> None:
     ap.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
     ap.add_argument("--think-seconds", type=float, default=3.5,
                     help="target thinking time per move (default 3.5)")
-    ap.add_argument("--max-sims", type=int, default=700_000,
-                    help="ceiling on simulations per move; memory scales with "
-                         "it (~2.5 KB per node, so 700k nodes is ~1.8 GB)")
+    ap.add_argument("--max-sims", type=int, default=200_000,
+                    help="ceiling on simulations per move; the tree is "
+                         "preallocated at ~2.5 KB per node, so this costs "
+                         "~0.5 GB of RAM up front (700k would be ~1.8 GB). "
+                         "The clock budget reaches ~77k simulations at the "
+                         "default think time, so this is headroom, not a target")
     ap.add_argument("--leaf-batch", type=int, default=Engine.LEAF,
                     help="leaves per network call; raises the raw rate but "
                          "lowers the quality of each simulation")

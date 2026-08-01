@@ -135,6 +135,55 @@ class Trainer:
             grad_norm=float(grad_norm),
         )
 
+    @torch.no_grad()
+    def value_mae_on(self, states: np.ndarray, targets: np.ndarray,
+                     batch: int = 512) -> float:
+        """Mean absolute value error on a held-out set, no search involved.
+
+        The promotion and Elo gates play their games at 200 simulations, where a
+        branch holding 0.6% of the prior receives about one visit. A value repair
+        confined to such branches is therefore invisible to them -- it could be a
+        real improvement and still be gated out. This measures the value head
+        directly against deep-search labels, which is the thing being repaired.
+        """
+        from quoridor.encoding import ROT180_ACTION
+        from quoridor.mcts import _encode_batch
+        from quoridor.fastrules import NUM_ACTIONS, SCRATCH_SIZE, legal_mask
+
+        n = len(states)
+        if n == 0:
+            return float("nan")
+        rot = ROT180_ACTION.astype(np.int32)
+        was_training = self.net.training
+        self.net.eval()
+        total = 0.0
+        for s in range(0, n, batch):
+            chunk = np.ascontiguousarray(states[s:s + batch])
+            b = len(chunk)
+            legal = np.zeros((b, NUM_ACTIONS), dtype=np.uint8)
+            scratch = np.zeros((b, SCRATCH_SIZE), dtype=np.int32)
+            for i in range(b):
+                legal_mask(chunk[i], legal[i], scratch[i])
+            planes = np.zeros((b, 8, 9, 9), dtype=np.float32)
+            legal_c = np.zeros((b, NUM_ACTIONS), dtype=np.uint8)
+            flipped = np.zeros(b, dtype=np.uint8)
+            d0 = np.zeros((b, 81), dtype=np.int32)
+            d1 = np.zeros((b, 81), dtype=np.int32)
+            canon = np.zeros((b, chunk.shape[1]), dtype=np.uint8)
+            _encode_batch(chunk, planes, legal, legal_c, flipped,
+                          scratch, d0, d1, canon, rot)
+            x = torch.from_numpy(planes).to(self.device)
+            if self.device.startswith("cuda"):
+                x = x.contiguous(memory_format=torch.channels_last)
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.use_amp):
+                _, v = self.net(x)
+            z = torch.from_numpy(
+                np.ascontiguousarray(targets[s:s + batch])).to(self.device)
+            total += (v.float().reshape(-1) - z).abs().sum().item()
+        if was_training:
+            self.net.train()
+        return total / n
+
     def train_on_buffer(self, buffer, n_steps: int, log_every: int = 0) -> TrainStats:
         """Run ``n_steps`` optimiser steps, returning the mean of the last decile."""
         recent: list[TrainStats] = []
